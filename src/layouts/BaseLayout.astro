@@ -27,6 +27,16 @@ const {
       rel="stylesheet"
       href="https://fonts.googleapis.com/css2?family=Shantell+Sans:ital,wght@0,500;0,600;0,700;1,500&family=Lexend:wght@400;500;600&family=JetBrains+Mono:wght@400;600&display=swap"
     />
+
+    {/* Cloudflare Web Analytics (production builds only) */}
+    {import.meta.env.PROD && (
+      <script
+        is:inline
+        type="module"
+        src="https://static.cloudflareinsights.com/beacon.min.js"
+        data-cf-beacon={`{"token": "6581908fdfdd44638bb45eafb4c67726"}`}
+      ></script>
+    )}
   </head>
   <body>
     <div class="wrap">

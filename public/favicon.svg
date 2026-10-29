@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48" fill="none"
+     stroke-linecap="round" stroke-linejoin="round">
+  <!-- append-only log tape -->
+  <rect x="4" y="15" width="30" height="18" rx="3" stroke="#1b2a28" stroke-width="2.6" fill="#fbfdfc"/>
+  <g stroke="#5d7471" stroke-width="1.8">
+    <line x1="12" y1="15" x2="12" y2="33"/>
+    <line x1="20" y1="15" x2="20" y2="33"/>
+  </g>
+  <g stroke="#5d7471" stroke-width="2">
+    <line x1="7" y1="24" x2="10" y2="24"/>
+    <line x1="15" y1="24" x2="18" y2="24"/>
+  </g>
+  <!-- write-ahead arrow -->
+  <path d="M34 24 L45 24" stroke="#6b4df6" stroke-width="2.8"/>
+  <path d="M40 19 L46 24 L40 29" stroke="#6b4df6" stroke-width="2.8" fill="none"/>
+  <!-- committed record (LSN) -->
+  <circle cx="28" cy="24" r="2.6" fill="#0f9d8f"/>
+</svg>

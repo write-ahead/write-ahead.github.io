@@ -1,0 +1,26 @@
+---
+import BaseLayout from '../../layouts/BaseLayout.astro';
+import { getAllTags } from '../../utils/chapters';
+
+const tags = await getAllTags();
+---
+
+<BaseLayout title="Topics" description="Browse Write-Ahead by topic.">
+  <a class="back-link" href="/">← the book</a>
+  <h1 style="margin-top:14px;">Browse by topic</h1>
+  <p class="lede">Every chapter, sorted by what part of the engine it digs into.</p>
+
+  {tags.length === 0 ? (
+    <p class="byline">No topics yet.</p>
+  ) : (
+    <ul class="tag-cloud">
+      {tags.map((t) => (
+        <li>
+          <a class="tag tag-link" href={`/tags/${t.slug}/`}>
+            #{t.label} <span class="count">{t.chapters.length}</span>
+          </a>
+        </li>
+      ))}
+    </ul>
+  )}
+</BaseLayout>

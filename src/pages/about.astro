@@ -1,0 +1,106 @@
+---
+import BaseLayout from '../layouts/BaseLayout.astro';
+
+const email = 'kaleem@holisticresilience.org';
+---
+
+<BaseLayout title="About" description="What Write-Ahead is, and who's writing it.">
+  <a class="back-link" href="/">← the book</a>
+  <h1 style="margin-top:14px;">About</h1>
+
+  <section class="author-card" data-sketch-frame>
+    <div class="monogram" data-sketch-frame="circle" data-sketch-stroke="--accent">
+      <svg viewBox="0 0 120 120" role="img" aria-label="A hand-drawn database cylinder">
+        <ellipse cx="60" cy="34" rx="34" ry="12" fill="none" stroke="var(--accent)" stroke-width="3"/>
+        <path d="M26 34 V86 C26 92.6 41.2 98 60 98 C78.8 98 94 92.6 94 86 V34"
+              fill="none" stroke="var(--ink)" stroke-width="3" stroke-linecap="round"/>
+        <path d="M26 56 C26 62.6 41.2 68 60 68 C78.8 68 94 62.6 94 56"
+              fill="none" stroke="var(--ink-soft)" stroke-width="2.2"/>
+        <path d="M26 72 C26 78.6 41.2 84 60 84 C78.8 84 94 78.6 94 72"
+              fill="none" stroke="var(--ink-soft)" stroke-width="2.2"/>
+        <circle cx="46" cy="33" r="3" fill="var(--accent2)"/>
+      </svg>
+    </div>
+    <div class="author-text">
+      <h2 class="author-name">Write-Ahead</h2>
+      <p class="author-role">database internals · one chapter at a time</p>
+      <p>
+        I kept using databases without really knowing what happened after I pressed
+        <code>Enter</code> on a query. So I started taking the engine apart — the page
+        format, the B-tree, the write-ahead log, the lock manager — and drawing each piece
+        until it made sense.
+      </p>
+      <p>
+        Write-Ahead is that teardown, written in public. The bet is simple: if I can
+        <em>draw</em> how a part works, I actually understand it — and so will you.
+      </p>
+      <p class="contact">
+        Say hi · <a href={`mailto:${email}`}>{email}</a>
+      </p>
+    </div>
+  </section>
+
+  <h2>What this is</h2>
+  <p class="lede">
+    <b>Write-Ahead</b> is a hand-drawn tour of how a database works on the inside.
+  </p>
+  <p>
+    Every chapter takes one mechanism the docs gloss over and rebuilds it from first
+    principles — with sketches, byte layouts, and small animations you can poke at. Less
+    "here's the API," more "here's what the bytes are doing on disk." The goal is that you
+    leave able to <em>picture</em> the engine, not just call it.
+  </p>
+
+  <style>
+    .author-card {
+      position: relative;
+      display: flex;
+      gap: 26px;
+      align-items: flex-start;
+      flex-wrap: wrap;
+      background: var(--panel);
+      border-radius: 12px;
+      padding: 24px 24px 20px;
+      margin: 1.6em 0 2.4em;
+      box-shadow: 0 12px 30px -22px rgba(0, 0, 0, 0.55);
+    }
+    .monogram {
+      position: relative;
+      flex: none;
+      padding: 11px;
+      border-radius: 50%;
+    }
+    .monogram svg {
+      width: 150px;
+      height: 150px;
+      display: block;
+      background: color-mix(in srgb, var(--accent) 8%, var(--panel));
+      border-radius: 50%;
+    }
+    .author-text { flex: 1 1 260px; min-width: 0; }
+    .author-name {
+      font-family: var(--font-display);
+      font-size: clamp(2rem, 7vw, 2.6rem);
+      margin: 0 0 2px;
+      line-height: 1;
+    }
+    .author-role {
+      font-family: var(--font-hand);
+      color: var(--accent);
+      font-size: 1.1rem;
+      margin: 0 0 12px;
+    }
+    .author-text p { margin: 0 0 0.9em; }
+    .contact {
+      font-family: var(--font-hand);
+      color: var(--ink-soft);
+      font-size: 1.05rem;
+    }
+    .contact a { color: var(--accent); text-underline-offset: 3px; word-break: break-all; }
+
+    @media (max-width: 460px) {
+      .author-card { justify-content: center; text-align: center; }
+      .author-text { text-align: left; }
+    }
+  </style>
+</BaseLayout>

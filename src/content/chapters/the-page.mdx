@@ -1,0 +1,66 @@
+---
+title: The page — where rows actually live
+description: A database doesn't store rows in a big list. It stores them in fixed-size pages, and the layout inside one page explains a surprising amount.
+pubDate: 2026-10-15
+order: 1
+part: Storage
+tags: ['storage', 'on-disk']
+---
+
+import SlottedPage from '../../components/SlottedPage.tsx';
+import Annotate from '../../components/Annotate.tsx';
+import Figure from '../../components/Figure.astro';
+import MarginNote from '../../components/MarginNote.astro';
+
+Everything a database keeps on disk is cut into fixed-size blocks called
+<Annotate client:visible type="underline">pages</Annotate> — usually 8&nbsp;KB each. The
+table isn't one long scroll of rows; it's a pile of these pages, and *page zero* is where
+the file begins. So before anything else, it's worth knowing what's inside a single one.
+
+The trick every engine uses is the **slotted page**. The page fills from *both ends*: a
+small directory of slot pointers grows down from the top, the row data grows up from the
+bottom, and the free space in the middle is whatever's left.
+
+<Figure caption="Press insert — a slot appears up top, its row appears at the bottom, and the free space between them shrinks.">
+  <SlottedPage client:visible />
+</Figure>
+
+Why split it like this? Because rows are different sizes and they come and go. If you only
+ever appended rows, you'd have to shuffle everything whenever one in the middle was
+deleted. Instead the <Annotate client:visible type="circle" token="--accent2">slot directory</Annotate>
+is a layer of indirection: slot *2* always means "row 2," even if the engine later moves
+that row's bytes around inside the page to reclaim space.
+
+<MarginNote>
+  <b>Why fixed-size pages at all?</b> Disks and the OS move data in fixed blocks, and the
+  buffer pool caches whole pages in memory. A fixed size makes a page addressable by a
+  single number — its <b>page id</b> — which is exactly what an index stores to point at a row.
+</MarginNote>
+
+## Reading a page, byte by byte
+
+Peek at the first bytes of page zero and you'll see the header before any row data:
+
+<div class="hexblock">
+<span class="off">0000</span>  <span class="b0">00 00 00 00</span>  <span class="b0">0b 00</span>  <span class="b0">1f 20</span>   lsn · slots=11 · free=8223<br/>
+<span class="off">0008</span>  <span class="b0">20 00</span> <span class="b0">00 20</span>        upper · lower pointers<br/>
+<span class="off">000c</span>  <span class="b1">00 02 00 14</span> ...        slot 0 → (off 0x14, len 2)<br/>
+<span class="off">....</span>  <span class="b2">00 00 00 00 00 00</span> ...   free space<br/>
+<span class="off">1ff4</span>  <span class="b1">6b 61 6c 65 65 6d</span> ...   row bytes, growing upward
+</div>
+
+The <span class="ink-accent">header</span> is just bookkeeping: how many slots, where the
+free space starts and ends. The <span class="ink-teal">committed rows</span> sit at the far
+end. Everything in between is <span class="ink-red">free space</span> waiting to be claimed.
+
+## What you now know
+
+<ol class="steps">
+  <li>A table is a pile of fixed-size <b>pages</b>, not one long list of rows.</li>
+  <li>Inside a page, a <span class="ink-accent">slot directory</span> grows down and <span class="ink-teal">rows</span> grow up.</li>
+  <li>Slots are a layer of indirection, so the engine can move row bytes without changing a row's identity.</li>
+  <li>When the free space runs out, the page is <b>full</b> — and the row has to go somewhere else.</li>
+</ol>
+
+That last point is the whole reason indexes exist: once you have millions of pages, you
+need a way to find the right one without reading them all. That's the next chapter.

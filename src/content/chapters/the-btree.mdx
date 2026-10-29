@@ -1,0 +1,50 @@
+---
+title: The B+tree — finding a row without reading everything
+description: With millions of pages, a full scan is hopeless. The B+tree is the shallow, bushy tree that turns "find this key" into three or four page reads.
+pubDate: 2026-10-16
+order: 2
+part: Indexing
+tags: ['indexing', 'b-tree']
+---
+
+import BTreePath from '../../components/BTreePath.tsx';
+import Annotate from '../../components/Annotate.tsx';
+import Figure from '../../components/Figure.astro';
+import MarginNote from '../../components/MarginNote.astro';
+
+Once a table is millions of pages, reading them all to find one row — a
+<Annotate client:visible type="box" token="--rollback">sequential scan</Annotate> — is far
+too slow. You want to jump straight to the right page. That's what an index is for, and the
+one almost every database reaches for is the **B+tree**.
+
+A B+tree is deliberately *shallow and bushy*. Each node is a page full of keys, so even a
+tree holding billions of rows is only three or four levels deep. To find a key you start at
+the <Annotate client:visible type="underline">root</Annotate>, pick the child whose range
+contains your key, and repeat until you hit a leaf.
+
+<Figure caption="Each search reads one node per level: root → leaf → the key. Try a key that isn't there, too.">
+  <BTreePath client:visible />
+</Figure>
+
+The internal nodes don't store rows at all — only *separator keys* that say "go left if
+you're below me, right if you're above." All the real data lives in the
+<Annotate client:visible type="circle" token="--accent2">leaves</Annotate>. That's the "+"
+in B+tree, and it's why a lookup always costs the same: the height of the tree.
+
+<MarginNote>
+  <b>Why not a binary tree?</b> A binary tree of a billion keys is ~30 levels deep — 30
+  page reads. A B+tree packs hundreds of keys per node, so the same billion keys fit in
+  about <b>4</b> levels. Fewer levels means fewer disk reads, and disk reads are the
+  whole game.
+</MarginNote>
+
+## The shape of a lookup
+
+<ol class="steps">
+  <li><b>Start at the root.</b> One page read, already cached in memory most of the time.</li>
+  <li><b>Follow a separator.</b> Compare your key to the node's keys and descend into the one child whose range fits.</li>
+  <li><b>Land on a leaf.</b> Either your key is here — <span class="ink-teal">found</span> — or it isn't: <span class="ink-red">no such row</span>.</li>
+</ol>
+
+Three or four reads, no matter how big the table gets. In the next chapter we'll make the
+tree *grow*: what happens to a leaf when it fills up and has to split.

@@ -13,6 +13,10 @@ const chapters = defineCollection({
     part: z.string().default('Internals'),
     tags: z.array(z.string()).default([]),
     draft: z.boolean().default(false),
+    /** social-share image: a path like /og/the-wal.png (in public/) or a full
+     *  URL. Omit to fall back to the site-wide /og-default.png card.
+     *  For best results make it 1200×630. */
+    ogImage: z.string().optional(),
   }),
 });
 

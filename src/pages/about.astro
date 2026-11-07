@@ -1,29 +1,22 @@
 ---
 import BaseLayout from '../layouts/BaseLayout.astro';
 
-const email = 'kaleem@holisticresilience.org';
+const email = 'rdm355190@gmail.com';
 ---
 
 <BaseLayout title="About" description="What Write-Ahead is, and who's writing it.">
-  <a class="back-link" href="/">← the book</a>
+  <a class="back-link" href="/">← the log</a>
   <h1 style="margin-top:14px;">About</h1>
 
   <section class="author-card" data-sketch-frame>
-    <div class="monogram" data-sketch-frame="circle" data-sketch-stroke="--accent">
-      <svg viewBox="0 0 120 120" role="img" aria-label="A hand-drawn database cylinder">
-        <ellipse cx="60" cy="34" rx="34" ry="12" fill="none" stroke="var(--accent)" stroke-width="3"/>
-        <path d="M26 34 V86 C26 92.6 41.2 98 60 98 C78.8 98 94 92.6 94 86 V34"
-              fill="none" stroke="var(--ink)" stroke-width="3" stroke-linecap="round"/>
-        <path d="M26 56 C26 62.6 41.2 68 60 68 C78.8 68 94 62.6 94 56"
-              fill="none" stroke="var(--ink-soft)" stroke-width="2.2"/>
-        <path d="M26 72 C26 78.6 41.2 84 60 84 C78.8 84 94 78.6 94 72"
-              fill="none" stroke="var(--ink-soft)" stroke-width="2.2"/>
-        <circle cx="46" cy="33" r="3" fill="var(--accent2)"/>
-      </svg>
+    <div class="avatar-ring" data-sketch-frame="circle" data-sketch-stroke="--accent">
+      <div class="avatar-wrap">
+        <img src="/avatar.jpg" alt="Danish Mehmood" width="160" height="160" loading="eager" />
+      </div>
     </div>
     <div class="author-text">
       <h2 class="author-name">Write-Ahead</h2>
-      <p class="author-role">database internals · one chapter at a time</p>
+      <p class="author-role">database internals · one entry at a time</p>
       <p>
         I kept using databases without really knowing what happened after I pressed
         <code>Enter</code> on a query. So I started taking the engine apart — the page
@@ -45,7 +38,7 @@ const email = 'kaleem@holisticresilience.org';
     <b>Write-Ahead</b> is a hand-drawn tour of how a database works on the inside.
   </p>
   <p>
-    Every chapter takes one mechanism the docs gloss over and rebuilds it from first
+    Every entry takes one mechanism the docs gloss over and rebuilds it from first
     principles — with sketches, byte layouts, and small animations you can poke at. Less
     "here's the API," more "here's what the bytes are doing on disk." The goal is that you
     leave able to <em>picture</em> the engine, not just call it.
@@ -64,18 +57,39 @@ const email = 'kaleem@holisticresilience.org';
       margin: 1.6em 0 2.4em;
       box-shadow: 0 12px 30px -22px rgba(0, 0, 0, 0.55);
     }
-    .monogram {
+    .avatar-ring {
       position: relative;
       flex: none;
-      padding: 11px;
+      padding: 11px;            /* room for the sketched ring to sit outside the photo */
       border-radius: 50%;
     }
-    .monogram svg {
-      width: 150px;
-      height: 150px;
-      display: block;
-      background: color-mix(in srgb, var(--accent) 8%, var(--panel));
+    .avatar-wrap {
+      position: relative;
+      width: 160px;
+      height: 160px;
       border-radius: 50%;
+      overflow: hidden;
+    }
+    .avatar-wrap img {
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+      display: block;
+    }
+    /* warm, blog-themed overlay so the photo blends into the palette */
+    .avatar-wrap::after {
+      content: '';
+      position: absolute;
+      inset: 0;
+      border-radius: 50%;
+      background:
+        radial-gradient(120% 120% at 30% 15%, transparent 38%,
+          color-mix(in srgb, var(--accent) 55%, transparent) 100%),
+        linear-gradient(160deg,
+          color-mix(in srgb, var(--accent) 22%, transparent),
+          color-mix(in srgb, var(--accent2) 18%, transparent));
+      mix-blend-mode: overlay;
+      pointer-events: none;
     }
     .author-text { flex: 1 1 260px; min-width: 0; }
     .author-name {

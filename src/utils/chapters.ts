@@ -27,21 +27,23 @@ export function slugifyTag(tag: string): string {
     .replace(/^-+|-+$/g, '');
 }
 
-/** All non-draft chapters, in reading order (by `order`). */
+/** Live posts only (status 'posted'), in reading order (by `order`).
+ *  These are the ones that get a page, tags, prev/next and numbering. */
 export async function getPublishedChapters(): Promise<Chapter[]> {
-  const chapters = await getCollection('chapters', ({ data }) => !data.draft);
+  const chapters = await getCollection('chapters', ({ data }) => data.status === 'posted');
   return chapters.sort((a, b) => a.data.order - b.data.order);
 }
 
-/** Every chapter including drafts, in reading order — used for the book's ToC. */
-export async function getAllChapters(): Promise<Chapter[]> {
-  const chapters = await getCollection('chapters');
+/** Posts readers may see in listings: 'posted' + 'soon' (drafts excluded). */
+export async function getListedChapters(): Promise<Chapter[]> {
+  const chapters = await getCollection('chapters', ({ data }) => data.status !== 'draft');
   return chapters.sort((a, b) => a.data.order - b.data.order);
 }
 
-/** Chapters grouped into Parts, each in reading order; Parts ordered by first chapter. */
-export async function getParts(includeDrafts = true): Promise<PartGroup[]> {
-  const chapters = includeDrafts ? await getAllChapters() : await getPublishedChapters();
+/** Chapters grouped into Parts, each in reading order; Parts ordered by first chapter.
+ *  By default includes "coming soon" posts; set false for live posts only. */
+export async function getParts(includeComingSoon = true): Promise<PartGroup[]> {
+  const chapters = includeComingSoon ? await getListedChapters() : await getPublishedChapters();
   const map = new Map<string, PartGroup>();
   for (const ch of chapters) {
     const name = ch.data.part;
@@ -51,24 +53,40 @@ export async function getParts(includeDrafts = true): Promise<PartGroup[]> {
   return [...map.values()];
 }
 
-/** The chapter before and after a given one in reading order (published only). */
+/** The public URL for a chapter: its `path` override, else its file id. */
+export function chapterHref(ch: Chapter): string {
+  return `/${ch.data.path ?? ch.id}`;
+}
+
+/** Published chapters sharing a Part, in reading order. A Part acts as a series:
+ *  navigation and numbering never cross into other Parts (e.g. the dummy posts). */
+async function getSeriesChapters(part: string): Promise<Chapter[]> {
+  const chapters = await getPublishedChapters();
+  return chapters.filter((c) => c.data.part === part);
+}
+
+/** The chapter before and after a given one, within its own Part/series. */
 export async function getNeighbors(
   id: string
 ): Promise<{ prev: Chapter | null; next: Chapter | null }> {
-  const chapters = await getPublishedChapters();
-  const i = chapters.findIndex((c) => c.id === id);
-  if (i === -1) return { prev: null, next: null };
+  const all = await getPublishedChapters();
+  const self = all.find((c) => c.id === id);
+  if (!self) return { prev: null, next: null };
+  const series = await getSeriesChapters(self.data.part);
+  const i = series.findIndex((c) => c.id === id);
   return {
-    prev: i > 0 ? chapters[i - 1] : null,
-    next: i < chapters.length - 1 ? chapters[i + 1] : null,
+    prev: i > 0 ? series[i - 1] : null,
+    next: i < series.length - 1 ? series[i + 1] : null,
   };
 }
 
-/** Reading-order index (1-based) of a chapter among published chapters. */
+/** 1-based index of a chapter within its own Part/series. */
 export async function getChapterNumber(id: string): Promise<number> {
-  const chapters = await getPublishedChapters();
-  const i = chapters.findIndex((c) => c.id === id);
-  return i === -1 ? 0 : i + 1;
+  const all = await getPublishedChapters();
+  const self = all.find((c) => c.id === id);
+  if (!self) return 0;
+  const series = await getSeriesChapters(self.data.part);
+  return series.findIndex((c) => c.id === id) + 1;
 }
 
 /** Every tag, each with its chapters, sorted by popularity then name. */

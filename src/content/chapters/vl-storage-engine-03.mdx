@@ -1,0 +1,10 @@
+---
+title: "VictoriaLogs storage internals: The in-memory buffer and the LSM merge engine"
+description: Writing one immutable part per flush would bury the disk in tiny files. We follow the in-memory buffer and the background merges that turn a storm of small parts into a few large ones — the log-structured merge tree at the heart of datadb.
+pubDate: 2026-11-17
+order: 3
+part: Log storage
+path: victorialogs/internals/storage-engine/lsm-merge-engine
+tags: ['log storage', 'victorialogs', 'lsm', 'merge']
+status: soon
+---

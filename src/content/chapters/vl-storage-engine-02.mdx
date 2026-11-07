@@ -1,0 +1,1002 @@
+---
+title: "VictoriaLogs storage internals: Sorting and the immutable part"
+description: Post 1 left us holding a buffer of typed rows in arrival order. The naive move is to flush it to a file as-is — and it fails three ways. Those three failures are exactly the three moves that build a part, sort by (streamID, timestamp), cut the rows into blocks, and freeze the result into an immutable directory you can skip without opening.
+pubDate: 2026-11-2
+order: 2
+part: Log storage
+path: victorialogs/internals/storage-engine/the-immutable-part
+tags: ['log storage', 'victorialogs', 'parts', 'sorting']
+status: soon
+---
+
+import Figure from '../../components/Figure.astro';
+import MarginNote from '../../components/MarginNote.astro';
+import Annotate from '../../components/Annotate.tsx';
+
+In the last post we watched a log line come in the front door: parsed into typed fields, stamped with a `streamID`, and dropped into an in-memory buffer. That is where we stopped — and it is worth being honest about how little we have so far.
+
+The buffer holds the rows **in the order they arrived**. Nothing more. The structure we worked so hard to compute (the streamID on every row) is sitting there unused, like luggage tags on bags still piled by the door.
+
+<Figure caption="Where Post 1 left us: one in-memory buffer of typed rows, each already stamped with its streamID, but laid out in pure arrival order. Streams are interleaved (teal rows and grey rows take turns) and timestamps are out of order even within a single stream. The structure is computed; it is not yet used for anything.">
+  <svg viewBox="0 0 720 290" role="img" aria-label="End of Post 1: arrival-order buffer" style="width:100%;height:auto">
+    <defs>
+      <filter id="p1" x="-4%" y="-6%" width="108%" height="112%"><feTurbulence type="fractalNoise" baseFrequency="0.012" numOctaves="2" seed="7" result="n"/><feDisplacementMap in="SourceGraphic" in2="n" scale="1.6"/></filter>
+      <marker id="p1a" markerWidth="9" markerHeight="9" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" style="fill:var(--ink-soft)"/></marker>
+    </defs>
+    <g filter="url(#p1)">
+      <rect x="54" y="54" width="520" height="212" rx="10" style="fill:var(--panel);stroke:var(--line);stroke-width:1.6"/>
+      <line x1="54" y1="92" x2="574" y2="92" style="stroke:var(--line);stroke-width:1.3"/>
+      <line x1="22" y1="108" x2="22" y2="252" style="stroke:var(--ink-soft);stroke-width:1.6" marker-end="url(#p1a)"/>
+      <circle cx="78" cy="112" r="7" style="fill:var(--accent2)"/>
+      <circle cx="78" cy="146" r="7" style="fill:var(--ink-soft)"/>
+      <circle cx="78" cy="180" r="7" style="fill:var(--accent2)"/>
+      <circle cx="78" cy="214" r="7" style="fill:var(--accent2)"/>
+      <circle cx="78" cy="248" r="7" style="fill:var(--ink-soft)"/>
+      <path d="M598 110 q12 0 12 14 l0 44 q0 14 12 14" style="fill:none;stroke:var(--accent2);stroke-width:1.6"/>
+      <path d="M598 196 q12 0 12 14 l0 30 q0 14 12 14" style="fill:none;stroke:var(--ink-soft);stroke-width:1.6"/>
+    </g>
+    <text x="22" y="100" text-anchor="middle" style="fill:var(--ink-soft);font-family:var(--font-hand);font-size:11px">arrival</text>
+    <text x="100" y="84" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:11px">stream</text>
+    <text x="250" y="84" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:11px">ts</text>
+    <text x="330" y="84" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:11px">fields</text>
+    <text x="314" y="40" text-anchor="middle" style="fill:var(--ink);font-family:var(--font-hand);font-size:15px;font-weight:700">in-memory buffer (logRows)</text>
+    <text x="96" y="116" style="fill:var(--ink);font-family:var(--font-mono);font-size:11px">svc=api</text>
+    <text x="96" y="150" style="fill:var(--ink);font-family:var(--font-mono);font-size:11px">svc=db</text>
+    <text x="96" y="184" style="fill:var(--ink);font-family:var(--font-mono);font-size:11px">svc=api</text>
+    <text x="96" y="218" style="fill:var(--ink);font-family:var(--font-mono);font-size:11px">svc=api</text>
+    <text x="96" y="252" style="fill:var(--ink);font-family:var(--font-mono);font-size:11px">svc=db</text>
+    <text x="250" y="116" style="fill:var(--rollback);font-family:var(--font-mono);font-size:11px">09:02</text>
+    <text x="250" y="150" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:11px">09:01</text>
+    <text x="250" y="184" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:11px">09:01</text>
+    <text x="250" y="218" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:11px">09:03</text>
+    <text x="250" y="252" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:11px">09:02</text>
+    <text x="330" y="116" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:11px">_msg=GET /x   level=info</text>
+    <text x="330" y="150" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:11px">_msg=boot     level=info</text>
+    <text x="330" y="184" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:11px">_msg=GET /    level=info</text>
+    <text x="330" y="218" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:11px">_msg=500 err  level=error</text>
+    <text x="330" y="252" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:11px">_msg=disk hot level=warn</text>
+    <text x="628" y="138" style="fill:var(--accent2);font-family:var(--font-hand);font-size:12px">streams</text>
+    <text x="628" y="154" style="fill:var(--accent2);font-family:var(--font-hand);font-size:12px">interleaved</text>
+    <text x="628" y="222" style="fill:var(--ink-soft);font-family:var(--font-hand);font-size:12px">ts out of</text>
+    <text x="628" y="238" style="fill:var(--ink-soft);font-family:var(--font-hand);font-size:12px">order</text>
+  </svg>
+</Figure>
+
+Three things about this buffer carry the whole post:
+
+- It has structure we computed — a `streamID` per row — but it **has not used that structure yet**. The rows are laid out by arrival, not by anything meaningful.
+- It is still in RAM, and it is still **growing**. More rows keep landing in it.
+- It is **not a file**. Nothing is on disk, nothing is searchable, nothing another process could ever read.
+
+Post 2 has one job: turn *this* into something on disk that you can actually search, and later, merge.
+
+### The naive flush
+
+The obvious move — the one you would write first — is to wait until the buffer fills up and then **spill it to a file exactly as it sits**. Arrival order, one row after another. New rows keep appending to that same file over time.
+
+<Figure caption="The naive flush: when the buffer fills, write its rows to a file in the order they sit — arrival order — and keep appending new rows to the same file forever. It is O(1), crash-simple, and it does persist the data. It is Post 1's buffer, spilled to disk. Everything that follows is what this file cannot do.">
+  <svg viewBox="0 0 720 230" role="img" aria-label="Naive flush to one growing file" style="width:100%;height:auto">
+    <defs>
+      <filter id="p2" x="-4%" y="-8%" width="108%" height="116%"><feTurbulence type="fractalNoise" baseFrequency="0.013" numOctaves="2" seed="3" result="n"/><feDisplacementMap in="SourceGraphic" in2="n" scale="1.7"/></filter>
+      <marker id="p2a" markerWidth="9" markerHeight="9" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" style="fill:var(--ink-soft)"/></marker>
+    </defs>
+    <g filter="url(#p2)">
+      <rect x="28" y="66" width="150" height="104" rx="10" style="fill:var(--panel);stroke:var(--line);stroke-width:1.6"/>
+      <line x1="178" y1="118" x2="270" y2="118" style="stroke:var(--ink-soft);stroke-width:1.8" marker-end="url(#p2a)"/>
+      <rect x="282" y="40" width="330" height="156" rx="10" style="fill:var(--panel);stroke:var(--line);stroke-width:1.6"/>
+      <rect x="298" y="58" width="298" height="22" rx="4" style="fill:color-mix(in srgb,var(--accent2) 12%,var(--panel));stroke:var(--line);stroke-width:1.1"/>
+      <rect x="298" y="86" width="298" height="22" rx="4" style="fill:var(--panel);stroke:var(--line);stroke-width:1.1"/>
+      <rect x="298" y="114" width="298" height="22" rx="4" style="fill:color-mix(in srgb,var(--accent2) 12%,var(--panel));stroke:var(--line);stroke-width:1.1"/>
+      <rect x="298" y="142" width="298" height="22" rx="4" style="fill:color-mix(in srgb,var(--accent2) 12%,var(--panel));stroke:var(--line);stroke-width:1.1"/>
+      <rect x="298" y="170" width="298" height="22" rx="4" style="fill:var(--panel);stroke:var(--line);stroke-width:1.1"/>
+      <line x1="636" y1="118" x2="690" y2="118" style="stroke:var(--accent2);stroke-width:1.8" marker-end="url(#p2a)"/>
+    </g>
+    <text x="103" y="104" text-anchor="middle" style="fill:var(--ink);font-family:var(--font-hand);font-size:14px">buffer</text>
+    <text x="103" y="126" text-anchor="middle" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:10px">arrival order</text>
+    <text x="224" y="108" text-anchor="middle" style="fill:var(--ink-soft);font-family:var(--font-hand);font-size:12px">flush</text>
+    <text x="447" y="32" text-anchor="middle" style="fill:var(--ink);font-family:var(--font-hand);font-size:14px">naive-flush.log</text>
+    <text x="308" y="73" style="fill:var(--ink);font-family:var(--font-mono);font-size:10px">S_api  09:02  GET /x</text>
+    <text x="308" y="101" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:10px">S_db   09:01  boot</text>
+    <text x="308" y="129" style="fill:var(--ink);font-family:var(--font-mono);font-size:10px">S_api  09:01  GET /</text>
+    <text x="308" y="157" style="fill:var(--ink);font-family:var(--font-mono);font-size:10px">S_api  09:03  500 err</text>
+    <text x="308" y="185" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:10px">S_db   09:02  disk hot</text>
+    <text x="700" y="112" text-anchor="middle" style="fill:var(--accent2);font-family:var(--font-mono);font-size:14px">⟶</text>
+    <text x="690" y="138" text-anchor="end" style="fill:var(--accent2);font-family:var(--font-hand);font-size:11px">append forever</text>
+    <text x="447" y="218" text-anchor="middle" style="fill:var(--ink-soft);font-family:var(--font-hand);font-size:13px">O(1) · crash-simple · and completely unsearchable</text>
+  </svg>
+</Figure>
+
+This is the honest baseline. It genuinely works. It is `cat buffer >> file`, forever. So instead of hand-waving that it is "bad," let us actually try to *use* this file — and watch exactly where it breaks. Each crack has a name, and each name is one of the three moves that make up the rest of this post.
+
+### Crack #1 — arrival order serves no query
+
+Every row in the file carries a `streamID`, but on disk they are interleaved and time-shuffled. Try the two queries that logs are actually made of:
+
+<Figure caption="Two ordinary queries, both forced into a full scan. On the left, 'give me stream S_api' — but S_api is smeared down the file with S_db in between, so there is no run to seek to and nowhere to stop early. On the right, 'give me rows in [09:01, 09:02]' — but a 09:01 row can sit below a 09:03 row, so you cannot binary-search by time. Arrival order answers neither question without reading everything.">
+  <svg viewBox="0 0 720 300" role="img" aria-label="Arrival order forces a full scan for both query shapes" style="width:100%;height:auto">
+    <defs>
+      <filter id="p3" x="-4%" y="-5%" width="108%" height="110%"><feTurbulence type="fractalNoise" baseFrequency="0.013" numOctaves="2" seed="11" result="n"/><feDisplacementMap in="SourceGraphic" in2="n" scale="1.6"/></filter>
+      <marker id="p3a" markerWidth="9" markerHeight="9" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" style="fill:var(--accent)"/></marker>
+    </defs>
+    <g filter="url(#p3)">
+      <rect x="88" y="52" width="200" height="222" rx="10" style="fill:var(--panel);stroke:var(--line);stroke-width:1.5"/>
+      <rect x="432" y="52" width="200" height="222" rx="10" style="fill:var(--panel);stroke:var(--line);stroke-width:1.5"/>
+      <line x1="74" y1="78" x2="74" y2="264" style="stroke:var(--accent);stroke-width:2" marker-end="url(#p3a)"/>
+      <line x1="418" y1="78" x2="418" y2="264" style="stroke:var(--accent);stroke-width:2" marker-end="url(#p3a)"/>
+    </g>
+    <text x="188" y="42" text-anchor="middle" style="fill:var(--accent);font-family:var(--font-mono);font-size:12px">stream = S_api</text>
+    <text x="532" y="42" text-anchor="middle" style="fill:var(--accent);font-family:var(--font-mono);font-size:12px">ts in [09:01, 09:02]</text>
+    <text x="108" y="82" style="fill:var(--accent2);font-family:var(--font-mono);font-size:12px">S_api  ◀ match</text>
+    <text x="108" y="114" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:12px">S_db</text>
+    <text x="108" y="146" style="fill:var(--accent2);font-family:var(--font-mono);font-size:12px">S_api  ◀ match</text>
+    <text x="108" y="178" style="fill:var(--accent2);font-family:var(--font-mono);font-size:12px">S_api  ◀ match</text>
+    <text x="108" y="210" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:12px">S_db</text>
+    <text x="108" y="242" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:12px">S_api  ...</text>
+    <text x="452" y="82" style="fill:var(--accent2);font-family:var(--font-mono);font-size:12px">09:02  ◀ match</text>
+    <text x="452" y="114" style="fill:var(--accent2);font-family:var(--font-mono);font-size:12px">09:01  ◀ match</text>
+    <text x="452" y="146" style="fill:var(--accent2);font-family:var(--font-mono);font-size:12px">09:01  ◀ match</text>
+    <text x="452" y="178" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:12px">09:03</text>
+    <text x="452" y="210" style="fill:var(--accent2);font-family:var(--font-mono);font-size:12px">09:02  ◀ match</text>
+    <text x="452" y="242" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:12px">09:01  ...</text>
+    <text x="63" y="290" text-anchor="middle" style="fill:var(--accent);font-family:var(--font-hand);font-size:12px">no skip</text>
+    <text x="407" y="290" text-anchor="middle" style="fill:var(--accent);font-family:var(--font-hand);font-size:12px">no skip</text>
+    <text x="360" y="150" text-anchor="middle" style="fill:var(--ink-soft);font-family:var(--font-hand);font-size:13px" transform="rotate(90 360 150)">both read all N rows</text>
+  </svg>
+</Figure>
+
+A sorted array is the cheapest index there is: binary-search to the first match, walk forward until the key changes, stop. Arrival order throws all of that away. So the first forced move is simple to state: **sort the rows before you write them.**
+
+The interesting question is *sort by what.*
+
+#### Sort by (streamID, timestamp) — streamID first
+
+Your instinct for a logging system is probably "sort by time." VictoriaLogs does not. It sorts **primary by `streamID`, secondary by `timestamp`** — the stream is the first key, time only breaks ties within a stream.
+
+<MarginNote>
+The sort key lives in <code>logRows.Less</code> — compare streamIDs first, fall back to timestamp only when they are equal. Everything in this post follows from that one ordering choice.
+</MarginNote>
+
+<Figure caption="Why streamID first. Sort by time alone (left) and the streams stay smeared — a stream query still scans the whole file. Sort by (streamID, timestamp) (right) and each stream collapses into one contiguous run, already in time order inside the run. Now a stream is a thing you can seek to, and its repetitive rows sit together, which is what later compression needs.">
+  <svg viewBox="0 0 720 310" role="img" aria-label="Sort by time only versus sort by streamID then timestamp" style="width:100%;height:auto">
+    <defs>
+      <filter id="p4" x="-4%" y="-5%" width="108%" height="110%"><feTurbulence type="fractalNoise" baseFrequency="0.013" numOctaves="2" seed="5" result="n"/><feDisplacementMap in="SourceGraphic" in2="n" scale="1.6"/></filter>
+    </defs>
+    <g filter="url(#p4)">
+      <rect x="40" y="58" width="236" height="226" rx="10" style="fill:var(--panel);stroke:var(--line);stroke-width:1.5"/>
+      <rect x="444" y="58" width="236" height="226" rx="10" style="fill:var(--panel);stroke:var(--accent2);stroke-width:1.8"/>
+      <rect x="456" y="76" width="212" height="94" rx="7" style="fill:color-mix(in srgb,var(--accent2) 10%,var(--panel));stroke:var(--accent2);stroke-width:1.4"/>
+      <rect x="456" y="178" width="212" height="94" rx="7" style="fill:color-mix(in srgb,var(--ink-soft) 10%,var(--panel));stroke:var(--ink-soft);stroke-width:1.4"/>
+      <path d="M288 160 q36 -14 72 0 t72 0" style="fill:none;stroke:var(--ink-soft);stroke-width:1.6" marker-end="url(#p3a)"/>
+    </g>
+    <text x="158" y="46" text-anchor="middle" style="fill:var(--ink-soft);font-family:var(--font-hand);font-size:13px">sort by time only</text>
+    <text x="562" y="46" text-anchor="middle" style="fill:var(--ink);font-family:var(--font-hand);font-size:13px">sort by (streamID, ts)</text>
+    <text x="60" y="88" style="fill:var(--accent2);font-family:var(--font-mono);font-size:12px">S_api   09:01</text>
+    <text x="60" y="116" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:12px">S_db    09:01</text>
+    <text x="60" y="144" style="fill:var(--accent2);font-family:var(--font-mono);font-size:12px">S_api   09:02</text>
+    <text x="60" y="172" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:12px">S_db    09:02</text>
+    <text x="60" y="200" style="fill:var(--accent2);font-family:var(--font-mono);font-size:12px">S_api   09:03</text>
+    <text x="60" y="228" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:12px">S_db    09:03</text>
+    <text x="60" y="262" style="fill:var(--rollback);font-family:var(--font-hand);font-size:11px">streams still smeared</text>
+    <text x="474" y="100" style="fill:var(--accent2);font-family:var(--font-mono);font-size:12px">S_api   09:01</text>
+    <text x="474" y="126" style="fill:var(--accent2);font-family:var(--font-mono);font-size:12px">S_api   09:02</text>
+    <text x="474" y="152" style="fill:var(--accent2);font-family:var(--font-mono);font-size:12px">S_api   09:03</text>
+    <text x="474" y="202" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:12px">S_db    09:01</text>
+    <text x="474" y="228" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:12px">S_db    09:02</text>
+    <text x="474" y="254" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:12px">S_db    09:03</text>
+    <text x="640" y="100" text-anchor="end" style="fill:var(--accent2);font-family:var(--font-hand);font-size:11px"> </text>
+    <text x="658" y="123" text-anchor="middle" style="fill:var(--accent2);font-family:var(--font-hand);font-size:11px">one run</text>
+    <text x="360" y="138" text-anchor="middle" style="fill:var(--ink-soft);font-family:var(--font-hand);font-size:12px">group</text>
+  </svg>
+</Figure>
+
+Sorting streamID-first makes **each stream a single contiguous run**. That is the layout you want for three different reasons at once: a stream query seeks straight to its run; a stream's wildly repetitive rows now sit next to each other (which is what sets up compression two posts from now); and one stream can be addressed without disturbing any other.
+
+There is an honest objection to answer here, because a sharp reader is already raising it:
+
+> "If `streamID` is the primary key, haven't you just **given up** fast time-range queries across all streams?"
+
+Partly, yes — you can no longer binary-search the whole file by time. Two things pay that back, and they are worth naming now even though the machinery lands later:
+
+1. **Ingest is roughly time-ordered** (that was workload property ③ from the last post). So within one flush, each stream's run is already time-*local* — it does not smear across the whole day.
+2. The next move attaches a **min/max timestamp to every block**. A time-range query reads those headers and *skips* whole blocks whose range cannot match — a coarse time index that survives the streamID-first order. (And the partition itself is bounded to a day, but that is Post 8.)
+
+So the choice is not "stream instead of time." It is "**stream as the sort key, time as cheap per-block skip metadata.**" Hold onto that framing — it is the reason the on-disk layout looks the way it does.
+
+### Crack #2 — one giant run has no seekable sub-unit
+
+Say we sorted the entire buffer into one long sorted blob. Better! But it is still *one object*. To read stream `S_api` you open the blob and scan to its run. To skip `S_api` by time you would have to read it anyway. There is no unit smaller than "the whole thing" to seek to, to skip, or — later — to compress on its own.
+
+So we cut the sorted run into **blocks**.
+
+<Figure caption="Cutting the sorted run into blocks. A block is the atom of storage: one stream's rows, in time order, with a tiny header carrying the streamID, the min/max timestamp, and a row count. Because the header describes the block, a query can reject a whole block — wrong stream, or a time range that cannot match — by reading a few bytes, never opening the rows. That skip is the first sublinear path in the entire series.">
+  <svg viewBox="0 0 720 300" role="img" aria-label="Sorted run cut into blocks with headers" style="width:100%;height:auto">
+    <defs>
+      <filter id="p5" x="-4%" y="-5%" width="108%" height="110%"><feTurbulence type="fractalNoise" baseFrequency="0.012" numOctaves="2" seed="9" result="n"/><feDisplacementMap in="SourceGraphic" in2="n" scale="1.5"/></filter>
+      <marker id="p5a" markerWidth="9" markerHeight="9" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" style="fill:var(--ink-soft)"/></marker>
+    </defs>
+    <g filter="url(#p5)">
+      <rect x="28" y="60" width="150" height="196" rx="9" style="fill:var(--panel);stroke:var(--line);stroke-width:1.5"/>
+      <line x1="178" y1="158" x2="236" y2="158" style="stroke:var(--ink-soft);stroke-width:1.8" marker-end="url(#p5a)"/>
+      <rect x="250" y="44" width="220" height="100" rx="9" style="fill:var(--panel);stroke:var(--accent2);stroke-width:1.8"/>
+      <rect x="260" y="54" width="200" height="22" rx="4" style="fill:color-mix(in srgb,var(--accent2) 16%,var(--panel));stroke:var(--accent2);stroke-width:1.2"/>
+      <rect x="250" y="168" width="220" height="100" rx="9" style="fill:var(--panel);stroke:var(--ink-soft);stroke-width:1.6"/>
+      <rect x="260" y="178" width="200" height="22" rx="4" style="fill:color-mix(in srgb,var(--ink-soft) 16%,var(--panel));stroke:var(--ink-soft);stroke-width:1.2"/>
+    </g>
+    <text x="103" y="50" text-anchor="middle" style="fill:var(--ink-soft);font-family:var(--font-hand);font-size:12px">sorted run</text>
+    <text x="48" y="90" style="fill:var(--accent2);font-family:var(--font-mono);font-size:11px">S_api 09:01</text>
+    <text x="48" y="114" style="fill:var(--accent2);font-family:var(--font-mono);font-size:11px">S_api 09:02</text>
+    <text x="48" y="138" style="fill:var(--accent2);font-family:var(--font-mono);font-size:11px">S_api 09:03</text>
+    <text x="48" y="178" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:11px">S_db  09:01</text>
+    <text x="48" y="202" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:11px">S_db  09:02</text>
+    <text x="207" y="150" text-anchor="middle" style="fill:var(--ink-soft);font-family:var(--font-hand);font-size:11px">cut</text>
+    <text x="270" y="70" style="fill:var(--accent2);font-family:var(--font-mono);font-size:10px">S_api · 09:01–09:03 · 3 rows</text>
+    <text x="270" y="98" style="fill:var(--ink);font-family:var(--font-mono);font-size:11px">GET /x · GET / · 500 err</text>
+    <text x="270" y="122" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:10px">...rows...</text>
+    <text x="270" y="194" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:10px">S_db · 09:01–09:02 · 2 rows</text>
+    <text x="270" y="222" style="fill:var(--ink);font-family:var(--font-mono);font-size:11px">boot · disk hot</text>
+    <text x="270" y="246" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:10px">...rows...</text>
+    <text x="490" y="68" style="fill:var(--ink-soft);font-family:var(--font-hand);font-size:12px">header</text>
+    <path d="M488 64 q-10 2 -16 -6" style="fill:none;stroke:var(--ink-soft);stroke-width:1.3" marker-end="url(#p5a)"/>
+    <text x="494" y="112" style="fill:var(--accent2);font-family:var(--font-hand);font-size:12px">block 0</text>
+    <text x="494" y="130" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:10px">one stream</text>
+    <text x="494" y="226" style="fill:var(--ink-soft);font-family:var(--font-hand);font-size:12px">block 1</text>
+    <text x="568" y="290" text-anchor="middle" style="fill:var(--ink-soft);font-family:var(--font-hand);font-size:12px">skip by header, never open the rows</text>
+  </svg>
+</Figure>
+
+The rule for where one block ends and the next begins is pleasantly simple:
+
+<Figure caption="The block-cutting rule. Walking the sorted rows, start a fresh block whenever the streamID changes — so a block never mixes two streams — or whenever the current block hits the size cap, maxUncompressedBlockSize (the same 2 MiB ceiling from Post 1). A block is therefore 'a bounded chunk of one stream, in time order.'">
+  <svg viewBox="0 0 720 180" role="img" aria-label="Block cutting rule: stream change or size cap" style="width:100%;height:auto">
+    <defs>
+      <filter id="p6" x="-3%" y="-10%" width="106%" height="120%"><feTurbulence type="fractalNoise" baseFrequency="0.013" numOctaves="2" seed="2" result="n"/><feDisplacementMap in="SourceGraphic" in2="n" scale="1.5"/></filter>
+    </defs>
+    <g filter="url(#p6)">
+      <rect x="260" y="30" width="200" height="56" rx="10" style="fill:var(--panel);stroke:var(--ink);stroke-width:1.8"/>
+      <rect x="40" y="118" width="300" height="46" rx="9" style="fill:color-mix(in srgb,var(--accent2) 10%,var(--panel));stroke:var(--accent2);stroke-width:1.6"/>
+      <rect x="380" y="118" width="300" height="46" rx="9" style="fill:color-mix(in srgb,var(--rollback) 10%,var(--panel));stroke:var(--rollback);stroke-width:1.6"/>
+      <line x1="300" y1="86" x2="190" y2="114" style="stroke:var(--ink-soft);stroke-width:1.5;fill:none"/>
+      <line x1="420" y1="86" x2="530" y2="114" style="stroke:var(--ink-soft);stroke-width:1.5;fill:none"/>
+    </g>
+    <text x="360" y="54" text-anchor="middle" style="fill:var(--ink);font-family:var(--font-hand);font-size:14px;font-weight:700">start a new block when…</text>
+    <text x="360" y="74" text-anchor="middle" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:11px">(walking the sorted rows)</text>
+    <text x="190" y="138" text-anchor="middle" style="fill:var(--accent2);font-family:var(--font-hand);font-size:13px">the streamID changes</text>
+    <text x="190" y="156" text-anchor="middle" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:10px">one block = one stream</text>
+    <text x="530" y="138" text-anchor="middle" style="fill:var(--rollback);font-family:var(--font-hand);font-size:13px">OR it hits the size cap</text>
+    <text x="530" y="156" text-anchor="middle" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:10px">maxUncompressedBlockSize · 2 MiB</text>
+  </svg>
+</Figure>
+
+One scope line, because it matters: **cutting rows *into* blocks is this post. What happens *inside* a block is not.** The transpose from rows to columns, the per-type value encoding, dictionaries, bloom filters — that is all Posts 4 and 5. For us, the block builder is a sealed box: sorted rows of one stream go in, an opaque finished block comes out. If we pry it open here, this post quietly swallows the next two.
+
+### Crack #3 — a mutable, growing file can't be trusted
+
+The naive baseline keeps *appending* to the same file forever. That single decision quietly breaks everything we just built.
+
+<Figure caption="Two wars started by one mutable file. Top: to keep the file sorted, a late-arriving 09:01 row has to be inserted mid-file — which shifts everything below it, O(n) per write, destroying Post 1's O(1) append. Bottom: a reader binary-searching block boundaries while a writer is appending finds the layout moving underneath it — so either you lock every read, or you risk a torn one. Sorted and mutable are at war; readable and mutable are at war.">
+  <svg viewBox="0 0 720 300" role="img" aria-label="A mutable file breaks sorting and reads" style="width:100%;height:auto">
+    <defs>
+      <filter id="p7" x="-3%" y="-5%" width="106%" height="110%"><feTurbulence type="fractalNoise" baseFrequency="0.013" numOctaves="2" seed="13" result="n"/><feDisplacementMap in="SourceGraphic" in2="n" scale="1.5"/></filter>
+      <marker id="p7a" markerWidth="9" markerHeight="9" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" style="fill:var(--rollback)"/></marker>
+    </defs>
+    <g filter="url(#p7)">
+      <rect x="40" y="36" width="150" height="108" rx="8" style="fill:var(--panel);stroke:var(--line);stroke-width:1.4"/>
+      <rect x="54" y="48" width="122" height="20" rx="3" style="fill:var(--panel);stroke:var(--line);stroke-width:1"/>
+      <rect x="54" y="72" width="122" height="20" rx="3" style="fill:color-mix(in srgb,var(--rollback) 16%,var(--panel));stroke:var(--rollback);stroke-width:1.4"/>
+      <rect x="54" y="96" width="122" height="20" rx="3" style="fill:var(--panel);stroke:var(--line);stroke-width:1"/>
+      <rect x="54" y="120" width="122" height="20" rx="3" style="fill:var(--panel);stroke:var(--line);stroke-width:1"/>
+      <line x1="240" y1="92" x2="300" y2="92" style="stroke:var(--rollback);stroke-width:1.8" marker-end="url(#p7a)"/>
+      <line x1="372" y1="72" x2="520" y2="72" style="stroke:var(--rollback);stroke-width:1.6" marker-end="url(#p7a)"/>
+      <line x1="372" y1="96" x2="520" y2="110" style="stroke:var(--rollback);stroke-width:1.6" marker-end="url(#p7a)"/>
+      <rect x="40" y="196" width="300" height="80" rx="9" style="fill:var(--panel);stroke:var(--line);stroke-width:1.4"/>
+      <line x1="60" y1="210" x2="60" y2="262" style="stroke:var(--accent);stroke-width:2"/>
+      <line x1="420" y1="196" x2="420" y2="276" style="stroke:var(--rollback);stroke-width:2;stroke-dasharray:5 4"/>
+    </g>
+    <text x="115" y="28" text-anchor="middle" style="fill:var(--ink-soft);font-family:var(--font-hand);font-size:12px">keep it sorted…</text>
+    <text x="115" y="63" text-anchor="middle" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:9px">09:03</text>
+    <text x="115" y="87" text-anchor="middle" style="fill:var(--rollback);font-family:var(--font-mono);font-size:9px">insert 09:01</text>
+    <text x="115" y="111" text-anchor="middle" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:9px">09:04</text>
+    <text x="115" y="135" text-anchor="middle" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:9px">09:05</text>
+    <text x="300" y="70" style="fill:var(--rollback);font-family:var(--font-hand);font-size:12px">shift everything below</text>
+    <text x="300" y="128" style="fill:var(--rollback);font-family:var(--font-hand);font-size:12px">O(n) per write</text>
+    <text x="360" y="178" style="fill:var(--ink-soft);font-family:var(--font-hand);font-size:12px">…and let a reader in while a writer appends</text>
+    <text x="80" y="232" style="fill:var(--accent);font-family:var(--font-hand);font-size:12px">reader seeking</text>
+    <text x="80" y="250" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:10px">block boundaries</text>
+    <text x="440" y="230" style="fill:var(--rollback);font-family:var(--font-hand);font-size:12px">writer appending</text>
+    <text x="440" y="250" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:10px">boundaries move</text>
+    <text x="440" y="268" style="fill:var(--rollback);font-family:var(--font-mono);font-size:10px">⇒ lock or tear</text>
+  </svg>
+</Figure>
+
+Both failures have one root cause: **the file is still changing.** Maintaining sort order under a stream of out-of-order appends means mid-file inserts — O(n) per row, which throws away the cheap ingest from Post 1. And a layout that moves under a reader forces a lock on every read, or risks a torn one.
+
+So the flush does not produce a file you keep editing. It produces a **write-once, never-modified unit: a part.** The instant a part is sealed, its sort order and block boundaries are frozen. Readers need no locks, because nothing inside a part ever changes again.
+
+<Figure caption="Immutability. The naive file (left) is one thing you mutate forever — so sorting breaks and reads race writes. VictoriaLogs (right) never mutates a sealed part: each flush produces a new part, internally sorted and then frozen. New data becomes the next part, never an edit to an old one. Across parts nothing is globally sorted — and that deliberate trade is the seed of the merge engine in the next post.">
+  <svg viewBox="0 0 720 220" role="img" aria-label="One mutable file versus a sequence of frozen parts" style="width:100%;height:auto">
+    <defs>
+      <filter id="p8" x="-3%" y="-8%" width="106%" height="116%"><feTurbulence type="fractalNoise" baseFrequency="0.013" numOctaves="2" seed="17" result="n"/><feDisplacementMap in="SourceGraphic" in2="n" scale="1.6"/></filter>
+    </defs>
+    <g filter="url(#p8)">
+      <rect x="40" y="58" width="200" height="110" rx="10" style="fill:color-mix(in srgb,var(--rollback) 7%,var(--panel));stroke:var(--rollback);stroke-width:1.6"/>
+      <path d="M62 118 q20 -16 40 0 t40 0 t40 0 t40 0" style="fill:none;stroke:var(--rollback);stroke-width:1.5"/>
+      <rect x="440" y="62" width="76" height="102" rx="9" style="fill:color-mix(in srgb,var(--accent2) 9%,var(--panel));stroke:var(--accent2);stroke-width:1.7"/>
+      <rect x="532" y="62" width="76" height="102" rx="9" style="fill:color-mix(in srgb,var(--accent2) 9%,var(--panel));stroke:var(--accent2);stroke-width:1.7"/>
+      <rect x="624" y="62" width="76" height="102" rx="9" style="fill:color-mix(in srgb,var(--accent2) 9%,var(--panel));stroke:var(--accent2);stroke-width:1.7"/>
+    </g>
+    <text x="140" y="46" text-anchor="middle" style="fill:var(--rollback);font-family:var(--font-hand);font-size:13px">naive: one file</text>
+    <text x="140" y="146" text-anchor="middle" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:10px">mutated forever</text>
+    <text x="140" y="188" text-anchor="middle" style="fill:var(--rollback);font-family:var(--font-hand);font-size:12px">sort breaks · reads race</text>
+    <text x="478" y="90" text-anchor="middle" style="fill:var(--accent2);font-family:var(--font-hand);font-size:12px">part 0</text>
+    <text x="570" y="90" text-anchor="middle" style="fill:var(--accent2);font-family:var(--font-hand);font-size:12px">part 1</text>
+    <text x="662" y="90" text-anchor="middle" style="fill:var(--accent2);font-family:var(--font-hand);font-size:12px">part 2</text>
+    <text x="478" y="116" text-anchor="middle" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:9px">sorted</text>
+    <text x="478" y="130" text-anchor="middle" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:9px">frozen</text>
+    <text x="570" y="116" text-anchor="middle" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:9px">sorted</text>
+    <text x="570" y="130" text-anchor="middle" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:9px">frozen</text>
+    <text x="662" y="116" text-anchor="middle" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:9px">sorted</text>
+    <text x="662" y="130" text-anchor="middle" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:9px">frozen</text>
+    <text x="570" y="188" text-anchor="middle" style="fill:var(--accent2);font-family:var(--font-hand);font-size:12px">each flush = a new part</text>
+    <text x="340" y="118" text-anchor="middle" style="fill:var(--ink-soft);font-family:var(--font-hand);font-size:20px">vs</text>
+  </svg>
+</Figure>
+
+The trade is deliberate. Inside a part, everything is sorted. *Across* parts, nothing is — a 09:01 row in part 2 might be older than a 09:03 row in part 0. We accept that on purpose, because immutability is the precondition that lets the next post **merge parts safely in the background** without ever locking a reader. We are only planting that seed here; Post 3 grows it.
+
+### What a part actually is
+
+Pull the three moves together and you have the thing this post produces: a **part** — an immutable directory bundling the sorted blocks, plus a small header describing them.
+
+<Figure caption="A part, and the nested skip it enables. The partHeader is a coarse filter over the whole part: its row count and overall timestamp range let a query reject an entire part by time, without opening a single block. Inside, each block carries its own stream and time range — a finer filter. Parts skip by time; blocks skip by stream and time; only the blocks that survive get read. That nested skip is the query model the rest of the series fills in.">
+  <svg viewBox="0 0 720 320" role="img" aria-label="Anatomy of a part and nested skipping" style="width:100%;height:auto">
+    <defs>
+      <filter id="p9" x="-3%" y="-5%" width="106%" height="110%"><feTurbulence type="fractalNoise" baseFrequency="0.012" numOctaves="2" seed="21" result="n"/><feDisplacementMap in="SourceGraphic" in2="n" scale="1.5"/></filter>
+      <marker id="p9a" markerWidth="9" markerHeight="9" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" style="fill:var(--accent)"/></marker>
+    </defs>
+    <g filter="url(#p9)">
+      <rect x="40" y="40" width="430" height="256" rx="12" style="fill:var(--panel);stroke:var(--accent2);stroke-width:1.9"/>
+      <rect x="58" y="60" width="394" height="60" rx="8" style="fill:color-mix(in srgb,var(--accent2) 12%,var(--panel));stroke:var(--accent2);stroke-width:1.6"/>
+      <rect x="58" y="138" width="394" height="66" rx="8" style="fill:var(--panel);stroke:var(--line);stroke-width:1.4"/>
+      <rect x="58" y="216" width="394" height="66" rx="8" style="fill:var(--panel);stroke:var(--line);stroke-width:1.4"/>
+      <line x1="530" y1="90" x2="462" y2="90" style="stroke:var(--accent);stroke-width:1.8" marker-end="url(#p9a)"/>
+      <line x1="530" y1="170" x2="462" y2="170" style="stroke:var(--accent);stroke-width:1.8" marker-end="url(#p9a)"/>
+      <line x1="530" y1="248" x2="462" y2="248" style="stroke:var(--line);stroke-width:1.6;stroke-dasharray:4 4"/>
+    </g>
+    <text x="255" y="32" text-anchor="middle" style="fill:var(--ink);font-family:var(--font-hand);font-size:14px;font-weight:700">part/ (immutable directory)</text>
+    <text x="72" y="84" style="fill:var(--accent2);font-family:var(--font-mono);font-size:11px;font-weight:700">partHeader</text>
+    <text x="72" y="104" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:10px">rows=N · ts∈[min,max] · blocks=B   (time only)</text>
+    <text x="72" y="160" style="fill:var(--ink);font-family:var(--font-mono);font-size:10px">block 0 · S_api · 09:01–09:03</text>
+    <text x="72" y="184" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:10px">sorted rows of one stream, sealed</text>
+    <text x="72" y="238" style="fill:var(--ink);font-family:var(--font-mono);font-size:10px">block 1 · S_db · 09:01–09:02</text>
+    <text x="72" y="262" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:10px">sorted rows of one stream, sealed</text>
+    <text x="544" y="86" style="fill:var(--accent);font-family:var(--font-hand);font-size:12px">reject whole</text>
+    <text x="544" y="102" style="fill:var(--accent);font-family:var(--font-hand);font-size:12px">part by header</text>
+    <text x="544" y="166" style="fill:var(--accent);font-family:var(--font-hand);font-size:12px">then skip a</text>
+    <text x="544" y="182" style="fill:var(--accent);font-family:var(--font-hand);font-size:12px">block by header</text>
+    <text x="544" y="246" style="fill:var(--ink-soft);font-family:var(--font-hand);font-size:12px">only survivors</text>
+    <text x="544" y="262" style="fill:var(--ink-soft);font-family:var(--font-hand);font-size:12px">get opened</text>
+  </svg>
+</Figure>
+
+Why a part is a *directory of several files* rather than one file — the columnar split — is a Post 4 question. For now, read a part as "the sorted blocks plus a header," not as a file list.
+
+### The three moves, in one picture
+
+That is the whole of Module 0: take the naive flush apart, and it hands you exactly three forced moves.
+
+<Figure caption="The ladder for this post. The naive flush — dump the arrival-order buffer to a single mutable file — cracks three ways, and each crack forces one move. Sort by (streamID, timestamp) so queries have an order to ride; cut the sorted run into blocks so there is a unit small enough to skip; freeze the result into an immutable part so reads are safe and the next post can merge. Do all three and you have built a part.">
+  <svg viewBox="0 0 720 320" role="img" aria-label="Three forced moves that build a part" style="width:100%;height:auto">
+    <defs>
+      <filter id="p10" x="-3%" y="-5%" width="106%" height="110%"><feTurbulence type="fractalNoise" baseFrequency="0.012" numOctaves="2" seed="23" result="n"/><feDisplacementMap in="SourceGraphic" in2="n" scale="1.5"/></filter>
+      <marker id="p10a" markerWidth="9" markerHeight="9" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" style="fill:var(--ink-soft)"/></marker>
+    </defs>
+    <g filter="url(#p10)">
+      <rect x="210" y="20" width="300" height="56" rx="11" style="fill:color-mix(in srgb,var(--rollback) 8%,var(--panel));stroke:var(--rollback);stroke-width:1.8"/>
+      <line x1="360" y1="76" x2="360" y2="104" style="stroke:var(--ink-soft);stroke-width:1.6" marker-end="url(#p10a)"/>
+      <rect x="24" y="110" width="212" height="128" rx="10" style="fill:var(--panel);stroke:var(--accent2);stroke-width:1.7"/>
+      <rect x="254" y="110" width="212" height="128" rx="10" style="fill:var(--panel);stroke:var(--accent2);stroke-width:1.7"/>
+      <rect x="484" y="110" width="212" height="128" rx="10" style="fill:var(--panel);stroke:var(--accent2);stroke-width:1.7"/>
+      <circle cx="54" cy="140" r="13" style="fill:var(--accent2)"/>
+      <circle cx="284" cy="140" r="13" style="fill:var(--accent2)"/>
+      <circle cx="514" cy="140" r="13" style="fill:var(--accent2)"/>
+      <line x1="236" y1="174" x2="254" y2="174" style="stroke:var(--ink-soft);stroke-width:1.4" marker-end="url(#p10a)"/>
+      <line x1="466" y1="174" x2="484" y2="174" style="stroke:var(--ink-soft);stroke-width:1.4" marker-end="url(#p10a)"/>
+      <rect x="254" y="268" width="212" height="40" rx="10" style="fill:color-mix(in srgb,var(--accent2) 12%,var(--panel));stroke:var(--accent2);stroke-width:1.8"/>
+      <line x1="360" y1="238" x2="360" y2="264" style="stroke:var(--accent2);stroke-width:1.8" marker-end="url(#p10a)"/>
+    </g>
+    <text x="360" y="45" text-anchor="middle" style="fill:var(--rollback);font-family:var(--font-hand);font-size:14px;font-weight:700">NAIVE FLUSH</text>
+    <text x="360" y="64" text-anchor="middle" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:10px">arrival-order buffer → one mutable file</text>
+    <text x="54" y="145" text-anchor="middle" style="fill:var(--panel);font-family:var(--font-hand);font-size:14px;font-weight:700">1</text>
+    <text x="284" y="145" text-anchor="middle" style="fill:var(--panel);font-family:var(--font-hand);font-size:14px;font-weight:700">2</text>
+    <text x="514" y="145" text-anchor="middle" style="fill:var(--panel);font-family:var(--font-hand);font-size:14px;font-weight:700">3</text>
+    <text x="80" y="134" style="fill:var(--ink);font-family:var(--font-hand);font-size:14px;font-weight:700">SORT</text>
+    <text x="40" y="180" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:10px">by (streamID, ts)</text>
+    <text x="40" y="198" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:10px">streamID first →</text>
+    <text x="40" y="214" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:10px">one run per stream</text>
+    <text x="310" y="134" style="fill:var(--ink);font-family:var(--font-hand);font-size:14px;font-weight:700">CUT BLOCKS</text>
+    <text x="270" y="180" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:10px">one stream / 2 MiB</text>
+    <text x="270" y="198" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:10px">header: min/max ts</text>
+    <text x="270" y="214" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:10px">= a skippable unit</text>
+    <text x="540" y="134" style="fill:var(--ink);font-family:var(--font-hand);font-size:14px;font-weight:700">FREEZE</text>
+    <text x="500" y="180" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:10px">write-once part</text>
+    <text x="500" y="198" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:10px">no locks on read</text>
+    <text x="500" y="214" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:10px">mergeable later</text>
+    <text x="360" y="293" text-anchor="middle" style="fill:var(--accent2);font-family:var(--font-hand);font-size:14px;font-weight:700">an immutable part</text>
+  </svg>
+</Figure>
+
+### Inside the flush: the two sorts
+
+We said a part is built in three moves — sort, cut, freeze. The rest of this chapter opens the box on the first one. It turns out to be *two* sorts, not one, and the reason the whole thing stays fast even for fat log rows is worth watching up close.
+
+All of it lives at the top of one function:
+
+```go
+func (mp *inmemoryPart) mustInitFromRows(lr *logRows) {
+	mp.reset()
+	sort.Sort(lr)            // sort #1 — reorder whole rows by (streamID, timestamp)
+	lr.sortFieldsInRows()    // sort #2 — reorder fields within each row by name
+	// ... cut the sorted rows into blocks (next section) ...
+}
+```
+
+<MarginNote>
+The <code>lr</code> handed in here is a pile of rows aggregated from many ingest requests and buffered for about a second before the flush. That buffer is its own story — we open it in the next chapter. For now it is just "a full buffer, in arrival order."
+</MarginNote>
+
+#### The buffer is a structure-of-arrays
+
+A log row can be fat — a hundred fields. If a row were one contiguous record, sorting a million of them would mean shoving a lot of bytes around. VictoriaLogs sidesteps that by never storing a row as a contiguous thing at all. The buffer is a set of **parallel arrays** — a structure-of-arrays — tied together by position.
+
+<Figure caption="The buffer, laid bare. Three per-row arrays (streamID, timestamp, and a rows pointer) are joined by index i. But rows[i] is not its own allocation — it is a window into one shared fieldsBuf, whose field names and values are themselves windows into a single byte arena. Everything heavy lives at the bottom, in the arena; the arrays on top are thin.">
+  <svg viewBox="0 0 720 292" role="img" aria-label="The logRows structure-of-arrays" style="width:100%;height:auto">
+    <defs>
+      <filter id="p11" x="-3%" y="-5%" width="106%" height="110%"><feTurbulence type="fractalNoise" baseFrequency="0.012" numOctaves="2" seed="31" result="n"/><feDisplacementMap in="SourceGraphic" in2="n" scale="1.5"/></filter>
+      <marker id="p11a" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto"><path d="M0,0 L7,4 L0,8 z" style="fill:var(--ink-soft)"/></marker>
+    </defs>
+    <g filter="url(#p11)">
+      <rect x="20" y="52" width="250" height="212" rx="10" style="fill:var(--panel);stroke:var(--line);stroke-width:1.5"/>
+      <line x1="20" y1="84" x2="270" y2="84" style="stroke:var(--line);stroke-width:1.2"/>
+      <rect x="320" y="52" width="250" height="212" rx="10" style="fill:var(--panel);stroke:var(--line);stroke-width:1.5"/>
+      <rect x="332" y="92" width="226" height="28" rx="4" style="fill:color-mix(in srgb,var(--accent2) 10%,var(--panel));stroke:var(--line);stroke-width:1.1"/>
+      <rect x="332" y="126" width="226" height="28" rx="4" style="fill:var(--panel);stroke:var(--line);stroke-width:1.1"/>
+      <rect x="332" y="160" width="226" height="28" rx="4" style="fill:color-mix(in srgb,var(--accent2) 10%,var(--panel));stroke:var(--line);stroke-width:1.1"/>
+      <rect x="332" y="194" width="226" height="28" rx="4" style="fill:color-mix(in srgb,var(--accent2) 10%,var(--panel));stroke:var(--line);stroke-width:1.1"/>
+      <rect x="332" y="228" width="226" height="28" rx="4" style="fill:var(--panel);stroke:var(--line);stroke-width:1.1"/>
+      <rect x="614" y="52" width="86" height="212" rx="10" style="fill:color-mix(in srgb,var(--ink-soft) 10%,var(--panel));stroke:var(--ink-soft);stroke-width:1.5"/>
+      <line x1="256" y1="106" x2="326" y2="106" style="stroke:var(--ink-soft);stroke-width:1.2" marker-end="url(#p11a)"/>
+      <line x1="256" y1="140" x2="326" y2="140" style="stroke:var(--ink-soft);stroke-width:1.2" marker-end="url(#p11a)"/>
+      <line x1="256" y1="174" x2="326" y2="174" style="stroke:var(--ink-soft);stroke-width:1.2" marker-end="url(#p11a)"/>
+      <line x1="256" y1="208" x2="326" y2="208" style="stroke:var(--ink-soft);stroke-width:1.2" marker-end="url(#p11a)"/>
+      <line x1="256" y1="242" x2="326" y2="242" style="stroke:var(--ink-soft);stroke-width:1.2" marker-end="url(#p11a)"/>
+      <line x1="560" y1="106" x2="610" y2="130" style="stroke:var(--ink-soft);stroke-width:1.1" marker-end="url(#p11a)"/>
+      <line x1="560" y1="174" x2="610" y2="170" style="stroke:var(--ink-soft);stroke-width:1.1" marker-end="url(#p11a)"/>
+      <line x1="560" y1="242" x2="610" y2="210" style="stroke:var(--ink-soft);stroke-width:1.1" marker-end="url(#p11a)"/>
+    </g>
+    <text x="145" y="44" text-anchor="middle" style="fill:var(--ink);font-family:var(--font-hand);font-size:13px">per-row arrays (index i)</text>
+    <text x="34" y="76" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:10px">streamID</text>
+    <text x="150" y="76" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:10px">ts</text>
+    <text x="215" y="76" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:10px">rows →</text>
+    <text x="34" y="110" style="fill:var(--accent2);font-family:var(--font-mono);font-size:10px">S_api</text>
+    <text x="34" y="144" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:10px">S_db</text>
+    <text x="34" y="178" style="fill:var(--accent2);font-family:var(--font-mono);font-size:10px">S_api</text>
+    <text x="34" y="212" style="fill:var(--accent2);font-family:var(--font-mono);font-size:10px">S_api</text>
+    <text x="34" y="246" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:10px">S_db</text>
+    <text x="150" y="110" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:10px">09:02</text>
+    <text x="150" y="144" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:10px">09:01</text>
+    <text x="150" y="178" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:10px">09:01</text>
+    <text x="150" y="212" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:10px">09:03</text>
+    <text x="150" y="246" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:10px">09:02</text>
+    <text x="230" y="110" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:12px">●</text>
+    <text x="230" y="144" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:12px">●</text>
+    <text x="230" y="178" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:12px">●</text>
+    <text x="230" y="212" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:12px">●</text>
+    <text x="230" y="246" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:12px">●</text>
+    <text x="445" y="44" text-anchor="middle" style="fill:var(--ink);font-family:var(--font-hand);font-size:13px">fieldsBuf (shared)</text>
+    <text x="340" y="110" style="fill:var(--ink);font-family:var(--font-mono);font-size:9px">[_msg|GET /x][level|info]</text>
+    <text x="340" y="144" style="fill:var(--ink);font-family:var(--font-mono);font-size:9px">[_msg|boot][level|info]</text>
+    <text x="340" y="178" style="fill:var(--ink);font-family:var(--font-mono);font-size:9px">[_msg|GET /][level|info]</text>
+    <text x="340" y="212" style="fill:var(--ink);font-family:var(--font-mono);font-size:9px">[_msg|500err][level|err]</text>
+    <text x="340" y="246" style="fill:var(--ink);font-family:var(--font-mono);font-size:9px">[_msg|hot][level|warn]</text>
+    <text x="657" y="44" text-anchor="middle" style="fill:var(--ink-soft);font-family:var(--font-hand);font-size:12px">arena a</text>
+    <text x="657" y="160" text-anchor="middle" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:10px" transform="rotate(90 657 160)">all name/value bytes</text>
+  </svg>
+</Figure>
+
+Row `i` is the triple `(streamIDs[i], timestamps[i], rows[i])`. The thing to carry forward: `rows[i]` is just a **window** into the shared `fieldsBuf`, and the field strings inside it are windows into the shared arena. That one fact is the whole reason the sort below is cheap.
+
+#### Sort #1 — reorder the rows
+
+`logRows` implements Go's `sort.Interface`, so `sort.Sort` can reorder it. The comparison is two-tiered:
+
+```go
+func (lr *logRows) Less(i, j int) bool {
+	a, b := &lr.streamIDs[i], &lr.streamIDs[j]
+	if !a.equal(b) {
+		return a.less(b)                       // primary key: streamID
+	}
+	return lr.timestamps[i] < lr.timestamps[j]    // tie-break: timestamp
+}
+```
+
+Run it over the buffer and the interleaved pile collapses into tidy, per-stream, time-ordered runs:
+
+<Figure caption="Sort #1 in action. The arrival-order pile (left) becomes grouped-by-stream, ascending-in-time runs (right): all S_api together in time order, then all S_db. This is the contiguous run Module 0 argued for — now it is a line of code. And crucially, not one field byte moved to make it happen.">
+  <svg viewBox="0 0 720 286" role="img" aria-label="Sort #1 reorders rows into per-stream runs" style="width:100%;height:auto">
+    <defs>
+      <filter id="p12" x="-3%" y="-5%" width="106%" height="110%"><feTurbulence type="fractalNoise" baseFrequency="0.012" numOctaves="2" seed="33" result="n"/><feDisplacementMap in="SourceGraphic" in2="n" scale="1.5"/></filter>
+      <marker id="p12a" markerWidth="10" markerHeight="10" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" style="fill:var(--ink-soft)"/></marker>
+    </defs>
+    <g filter="url(#p12)">
+      <rect x="28" y="46" width="248" height="190" rx="10" style="fill:var(--panel);stroke:var(--line);stroke-width:1.5"/>
+      <rect x="444" y="46" width="248" height="190" rx="10" style="fill:var(--panel);stroke:var(--accent2);stroke-width:1.7"/>
+      <line x1="300" y1="140" x2="420" y2="140" style="stroke:var(--ink-soft);stroke-width:1.8" marker-end="url(#p12a)"/>
+      <line x1="456" y1="68" x2="456" y2="146" style="stroke:var(--accent2);stroke-width:2.4"/>
+      <line x1="456" y1="160" x2="456" y2="216" style="stroke:var(--ink-soft);stroke-width:2.4"/>
+    </g>
+    <text x="152" y="38" text-anchor="middle" style="fill:var(--ink-soft);font-family:var(--font-hand);font-size:12px">arrival order</text>
+    <text x="568" y="38" text-anchor="middle" style="fill:var(--ink);font-family:var(--font-hand);font-size:12px">after sort.Sort(lr)</text>
+    <text x="360" y="128" text-anchor="middle" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:10px">sort.Sort</text>
+    <text x="48" y="78" style="fill:var(--accent2);font-family:var(--font-mono);font-size:12px">S_api   09:02</text>
+    <text x="48" y="106" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:12px">S_db    09:01</text>
+    <text x="48" y="134" style="fill:var(--accent2);font-family:var(--font-mono);font-size:12px">S_api   09:01</text>
+    <text x="48" y="162" style="fill:var(--accent2);font-family:var(--font-mono);font-size:12px">S_api   09:03</text>
+    <text x="48" y="190" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:12px">S_db    09:02</text>
+    <text x="472" y="86" style="fill:var(--accent2);font-family:var(--font-mono);font-size:12px">S_api   09:01</text>
+    <text x="472" y="114" style="fill:var(--accent2);font-family:var(--font-mono);font-size:12px">S_api   09:02</text>
+    <text x="472" y="142" style="fill:var(--accent2);font-family:var(--font-mono);font-size:12px">S_api   09:03</text>
+    <text x="472" y="184" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:12px">S_db    09:01</text>
+    <text x="472" y="212" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:12px">S_db    09:02</text>
+    <text x="668" y="110" text-anchor="end" style="fill:var(--accent2);font-family:var(--font-hand);font-size:11px">run</text>
+    <text x="668" y="196" text-anchor="end" style="fill:var(--ink-soft);font-family:var(--font-hand);font-size:11px">run</text>
+    <text x="360" y="266" text-anchor="middle" style="fill:var(--ink-soft);font-family:var(--font-hand);font-size:12px">the arena never moved — only the row ordering changed</text>
+  </svg>
+</Figure>
+
+#### What "by streamID" really means — tenant, then stream, then time
+
+`streamID.less` is itself two-tiered: it compares the `tenantID` first, and only falls back to the 128-bit stream hash when the tenants match.
+
+```go
+type streamID struct {
+	tenantID TenantID  // (AccountID, ProjectID) — FIRST, on purpose
+	id       u128      // hash128 of the canonical stream labels
+}
+
+func (sid *streamID) less(a *streamID) bool {
+	if !sid.tenantID.Equal(&a.tenantID) {
+		return sid.tenantID.less(&a.tenantID)
+	}
+	return sid.id.less(&a.id)
+}
+```
+
+So the sort key is really **three levels deep**, and each level buys a property of the on-disk layout:
+
+<Figure caption="The real sort key, unfolded. Tenant comes first — so every tenant's data clusters physically (the struct comment says exactly this). Within a tenant, the stream hash groups each stream into one run. Within a stream, the timestamp orders rows in time. One comparison function, three layout guarantees.">
+  <svg viewBox="0 0 720 172" role="img" aria-label="Three-level sort key: tenant, stream, time" style="width:100%;height:auto">
+    <defs>
+      <filter id="p13" x="-3%" y="-8%" width="106%" height="116%"><feTurbulence type="fractalNoise" baseFrequency="0.012" numOctaves="2" seed="35" result="n"/><feDisplacementMap in="SourceGraphic" in2="n" scale="1.5"/></filter>
+      <marker id="p13a" markerWidth="9" markerHeight="9" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" style="fill:var(--ink-soft)"/></marker>
+    </defs>
+    <g filter="url(#p13)">
+      <rect x="24" y="40" width="190" height="56" rx="10" style="fill:color-mix(in srgb,var(--accent2) 10%,var(--panel));stroke:var(--accent2);stroke-width:1.7"/>
+      <rect x="266" y="40" width="190" height="56" rx="10" style="fill:color-mix(in srgb,var(--accent2) 7%,var(--panel));stroke:var(--accent2);stroke-width:1.5"/>
+      <rect x="508" y="40" width="190" height="56" rx="10" style="fill:var(--panel);stroke:var(--line);stroke-width:1.5"/>
+      <line x1="214" y1="68" x2="264" y2="68" style="stroke:var(--ink-soft);stroke-width:1.6" marker-end="url(#p13a)"/>
+      <line x1="456" y1="68" x2="506" y2="68" style="stroke:var(--ink-soft);stroke-width:1.6" marker-end="url(#p13a)"/>
+    </g>
+    <text x="119" y="66" text-anchor="middle" style="fill:var(--ink);font-family:var(--font-mono);font-size:13px">tenantID</text>
+    <text x="119" y="84" text-anchor="middle" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:9px">cluster per tenant</text>
+    <text x="361" y="66" text-anchor="middle" style="fill:var(--ink);font-family:var(--font-mono);font-size:13px">streamHash</text>
+    <text x="361" y="84" text-anchor="middle" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:9px">one run per stream</text>
+    <text x="603" y="66" text-anchor="middle" style="fill:var(--ink);font-family:var(--font-mono);font-size:13px">timestamp</text>
+    <text x="603" y="84" text-anchor="middle" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:9px">ascending in time</text>
+    <text x="360" y="128" text-anchor="middle" style="fill:var(--ink-soft);font-family:var(--font-hand);font-size:13px">one comparison, three guarantees — tenant isolation falls out for free</text>
+  </svg>
+</Figure>
+
+#### The trick — `Swap` moves pointers, not data
+
+Here is why sorting a buffer of fat rows is not expensive. Look at what `Swap` actually exchanges:
+
+```go
+func (lr *logRows) Swap(i, j int) {
+	lr.streamIDs[i],  lr.streamIDs[j]  = lr.streamIDs[j],  lr.streamIDs[i]   // ~24 bytes
+	lr.timestamps[i], lr.timestamps[j] = lr.timestamps[j], lr.timestamps[i]  //   8 bytes
+	lr.rows[i],       lr.rows[j]       = lr.rows[j],       lr.rows[i]         //  24 bytes (a slice header)
+}
+```
+
+`rows[i]` is a **slice header** — a pointer, a length, a capacity. Swapping `rows[i]` with `rows[j]` just swaps *which fieldsBuf window* each row points at. It does not move a single field, and it never touches the arena.
+
+<Figure caption="One swap, weighed. On the left, everything Swap exchanges: a streamID, a timestamp, and a slice header — a few dozen fixed bytes, no matter how fat the row. On the right, everything it leaves frozen: the fieldsBuf entries and the arena that holds every name and value. A 200-field row costs exactly as much to sort as a 2-field one.">
+  <svg viewBox="0 0 720 236" role="img" aria-label="Swap moves small headers and leaves the arena frozen" style="width:100%;height:auto">
+    <defs>
+      <filter id="p14" x="-3%" y="-6%" width="106%" height="112%"><feTurbulence type="fractalNoise" baseFrequency="0.012" numOctaves="2" seed="37" result="n"/><feDisplacementMap in="SourceGraphic" in2="n" scale="1.5"/></filter>
+    </defs>
+    <g filter="url(#p14)">
+      <rect x="24" y="44" width="310" height="168" rx="11" style="fill:var(--panel);stroke:var(--accent2);stroke-width:1.7"/>
+      <rect x="44" y="78" width="270" height="34" rx="7" style="fill:color-mix(in srgb,var(--accent2) 12%,var(--panel));stroke:var(--accent2);stroke-width:1.3"/>
+      <rect x="44" y="120" width="270" height="34" rx="7" style="fill:color-mix(in srgb,var(--accent2) 12%,var(--panel));stroke:var(--accent2);stroke-width:1.3"/>
+      <rect x="44" y="162" width="270" height="34" rx="7" style="fill:color-mix(in srgb,var(--accent2) 12%,var(--panel));stroke:var(--accent2);stroke-width:1.3"/>
+      <rect x="386" y="44" width="310" height="168" rx="11" style="fill:color-mix(in srgb,var(--ink-soft) 8%,var(--panel));stroke:var(--ink-soft);stroke-width:1.7"/>
+      <rect x="406" y="86" width="270" height="44" rx="7" style="fill:var(--panel);stroke:var(--line);stroke-width:1.3"/>
+      <rect x="406" y="142" width="270" height="52" rx="7" style="fill:color-mix(in srgb,var(--ink-soft) 10%,var(--panel));stroke:var(--line);stroke-width:1.3"/>
+    </g>
+    <text x="179" y="36" text-anchor="middle" style="fill:var(--accent2);font-family:var(--font-hand);font-size:13px;font-weight:700">Swap moves</text>
+    <text x="54" y="100" style="fill:var(--ink);font-family:var(--font-mono);font-size:11px">streamID</text>
+    <text x="304" y="100" text-anchor="end" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:11px">~24 B</text>
+    <text x="54" y="142" style="fill:var(--ink);font-family:var(--font-mono);font-size:11px">timestamp</text>
+    <text x="304" y="142" text-anchor="end" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:11px">8 B</text>
+    <text x="54" y="184" style="fill:var(--ink);font-family:var(--font-mono);font-size:11px">rows[i] header</text>
+    <text x="304" y="184" text-anchor="end" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:11px">24 B</text>
+    <text x="541" y="36" text-anchor="middle" style="fill:var(--ink-soft);font-family:var(--font-hand);font-size:13px;font-weight:700">Swap never touches</text>
+    <text x="541" y="113" text-anchor="middle" style="fill:var(--ink);font-family:var(--font-mono);font-size:11px">fieldsBuf (Field structs)</text>
+    <text x="541" y="166" text-anchor="middle" style="fill:var(--ink);font-family:var(--font-mono);font-size:11px">arena — every name &amp; value</text>
+    <text x="541" y="184" text-anchor="middle" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:10px">the heavy bytes stay put</text>
+  </svg>
+</Figure>
+
+One invariant keeps this correct: the three arrays are only meaningful *together*, so `Swap` moves all three in lockstep. Miss one and that column would desync from the other two, scrambling the rows. (`sort.Sort` is Go's introsort, by the way — not a stable sort — which is fine, because rows with an identical `(streamID, timestamp)` are interchangeable.)
+
+#### Sort #2 — order the fields inside each row
+
+The rows are sorted; the *fields inside* each row are still in whatever order ingest left them. The second sort fixes that, one row at a time:
+
+```go
+func (lr *logRows) sortFieldsInRows() {
+	for _, row := range lr.rows {
+		lr.sf = row            // sf aliases this row's fields (same backing segment)
+		sort.Sort(&lr.sf)      // sort them in place, by name
+	}
+}
+
+func (sf *sortedFields) Less(i, j int) bool { a := *sf; return a[i].Name < a[j].Name }  // by NAME
+```
+
+<Figure caption="Sort #2, on one row. The fields arrive in no particular order; sorting by name puts them in a canonical order ('_' sorts before 'h' before 'l'). A Field is just two string headers, so this shuffles pointers too — the name and value bytes never move. Every row now presents its columns in the same order, which is exactly what the columnar writer will want a couple of chapters from now.">
+  <svg viewBox="0 0 720 176" role="img" aria-label="Sort #2 orders fields within a row by name" style="width:100%;height:auto">
+    <defs>
+      <filter id="p15" x="-3%" y="-8%" width="106%" height="116%"><feTurbulence type="fractalNoise" baseFrequency="0.012" numOctaves="2" seed="39" result="n"/><feDisplacementMap in="SourceGraphic" in2="n" scale="1.5"/></filter>
+      <marker id="p15a" markerWidth="10" markerHeight="10" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" style="fill:var(--ink-soft)"/></marker>
+    </defs>
+    <g filter="url(#p15)">
+      <rect x="40" y="40" width="210" height="104" rx="10" style="fill:var(--panel);stroke:var(--line);stroke-width:1.5"/>
+      <rect x="470" y="40" width="210" height="104" rx="10" style="fill:var(--panel);stroke:var(--accent2);stroke-width:1.6"/>
+      <line x1="300" y1="92" x2="420" y2="92" style="stroke:var(--ink-soft);stroke-width:1.8" marker-end="url(#p15a)"/>
+    </g>
+    <text x="145" y="32" text-anchor="middle" style="fill:var(--ink-soft);font-family:var(--font-hand);font-size:12px">as it arrived</text>
+    <text x="575" y="32" text-anchor="middle" style="fill:var(--ink);font-family:var(--font-hand);font-size:12px">name-sorted</text>
+    <text x="360" y="80" text-anchor="middle" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:10px">sort by</text>
+    <text x="360" y="96" text-anchor="middle" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:10px">Name</text>
+    <text x="360" y="124" text-anchor="middle" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:10px">_ &lt; h &lt; l</text>
+    <text x="58" y="70" style="fill:var(--ink);font-family:var(--font-mono);font-size:12px">_msg  = GET /x</text>
+    <text x="58" y="96" style="fill:var(--ink);font-family:var(--font-mono);font-size:12px">level = info</text>
+    <text x="58" y="122" style="fill:var(--ink);font-family:var(--font-mono);font-size:12px">host  = n7</text>
+    <text x="488" y="70" style="fill:var(--ink);font-family:var(--font-mono);font-size:12px">_msg  = GET /x</text>
+    <text x="488" y="96" style="fill:var(--ink);font-family:var(--font-mono);font-size:12px">host  = n7</text>
+    <text x="488" y="122" style="fill:var(--ink);font-family:var(--font-mono);font-size:12px">level = info</text>
+  </svg>
+</Figure>
+
+*Why* canonical field order matters — how it lets the writer line columns up across rows — is a question for the columnar chapter. Here it is enough that sort #2 produces it, cheaply, for free, while we are already touching every row.
+
+After both sorts the buffer is grouped by tenant and stream, ascending in time within each stream, with every row's fields in name order. That is precisely the shape the next move wants.
+
+### Cutting the sorted rows into blocks
+
+The sort is done; move two is to **cut**. A single loop walks the sorted rows top to bottom, dropping each into a box, and tapes the box shut whenever a block should end. It keeps four scraps of state: `bsw` (the sealer that bakes a box into a finished block — its internals are Post 4), `trs` (the box being filled), `sidPrev` (the box's stream), and a running size tally.
+
+```go
+trs := getTmpRows()
+var sidPrev *streamID
+blockSize := uint64(0)                 // uncompressedBlockSizeBytes
+
+for i := range timestamps {
+	streamID := &streamIDs[i]
+	if sidPrev == nil {
+		sidPrev = streamID             // first row: label the first box
+	}
+	if blockSize >= maxUncompressedBlockSize || !streamID.equal(sidPrev) {
+		bsw.MustWriteRows(sidPrev, trs.timestamps, trs.rows)   // ← seal the current box
+		trs.reset()
+		sidPrev = streamID
+		blockSize = 0
+	}
+	trs.timestamps = append(trs.timestamps, timestamps[i])     // drop this row in
+	trs.rows = append(trs.rows, rows[i])
+	blockSize += uint64(EstimatedJSONRowLen(rows[i]))
+}
+bsw.MustWriteRows(sidPrev, trs.timestamps, trs.rows)           // ← seal the final box
+```
+
+Everything hinges on that one `if`. Tape the box shut and start a fresh one when **either** the stream changes (so a block is always exactly one stream) **or** the box reaches 2 MiB (`maxUncompressedBlockSize`, so even a giant stream is chopped into bounded blocks). Because the rows are sorted streamID-first, each stream's rows are already contiguous, so "stream changed" fires cleanly at the boundary between one run and the next.
+
+<Figure caption="The loop, walking the sorted 5-row buffer. The three S_api rows fill a box; the moment i3 arrives as a different stream, the box is sealed as block 0 and a new S_db box starts. One block per stream — because neither run came near 2 MiB. If a single stream's run exceeded 2 MiB, the size rule would slice it into several same-stream blocks instead.">
+  <svg viewBox="0 0 720 300" role="img" aria-label="Walking the sorted rows and cutting blocks" style="width:100%;height:auto">
+    <defs>
+      <filter id="p16" x="-3%" y="-5%" width="106%" height="110%"><feTurbulence type="fractalNoise" baseFrequency="0.012" numOctaves="2" seed="41" result="n"/><feDisplacementMap in="SourceGraphic" in2="n" scale="1.5"/></filter>
+      <marker id="p16a" markerWidth="9" markerHeight="9" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" style="fill:var(--ink-soft)"/></marker>
+    </defs>
+    <g filter="url(#p16)">
+      <rect x="24" y="48" width="200" height="186" rx="10" style="fill:var(--panel);stroke:var(--line);stroke-width:1.5"/>
+      <line x1="24" y1="150" x2="224" y2="150" style="stroke:var(--rollback);stroke-width:1.8;stroke-dasharray:6 4"/>
+      <rect x="470" y="60" width="226" height="74" rx="10" style="fill:color-mix(in srgb,var(--accent2) 10%,var(--panel));stroke:var(--accent2);stroke-width:1.8"/>
+      <rect x="470" y="158" width="226" height="74" rx="10" style="fill:color-mix(in srgb,var(--ink-soft) 10%,var(--panel));stroke:var(--ink-soft);stroke-width:1.7"/>
+      <line x1="228" y1="104" x2="466" y2="96" style="stroke:var(--ink-soft);stroke-width:1.6" marker-end="url(#p16a)"/>
+      <line x1="228" y1="196" x2="466" y2="194" style="stroke:var(--ink-soft);stroke-width:1.6" marker-end="url(#p16a)"/>
+    </g>
+    <text x="124" y="40" text-anchor="middle" style="fill:var(--ink-soft);font-family:var(--font-hand);font-size:12px">sorted rows</text>
+    <text x="40" y="76" style="fill:var(--accent2);font-family:var(--font-mono);font-size:11px">S_api  09:01</text>
+    <text x="40" y="104" style="fill:var(--accent2);font-family:var(--font-mono);font-size:11px">S_api  09:02</text>
+    <text x="40" y="132" style="fill:var(--accent2);font-family:var(--font-mono);font-size:11px">S_api  09:03</text>
+    <text x="40" y="180" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:11px">S_db   09:01</text>
+    <text x="40" y="208" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:11px">S_db   09:02</text>
+    <text x="214" y="146" text-anchor="end" style="fill:var(--rollback);font-family:var(--font-hand);font-size:11px">stream changes → cut</text>
+    <text x="583" y="90" text-anchor="middle" style="fill:var(--accent2);font-family:var(--font-hand);font-size:13px;font-weight:700">block 0</text>
+    <text x="583" y="112" text-anchor="middle" style="fill:var(--ink);font-family:var(--font-mono);font-size:11px">S_api × 3 · 09:01–09:03</text>
+    <text x="583" y="188" text-anchor="middle" style="fill:var(--ink-soft);font-family:var(--font-hand);font-size:13px;font-weight:700">block 1</text>
+    <text x="583" y="210" text-anchor="middle" style="fill:var(--ink);font-family:var(--font-mono);font-size:11px">S_db × 2 · 09:01–09:02</text>
+    <text x="360" y="268" text-anchor="middle" style="fill:var(--ink-soft);font-family:var(--font-hand);font-size:12px">a box is also sealed the moment it hits 2 MiB — a long stream splits into several blocks</text>
+  </svg>
+</Figure>
+
+Two subtleties worth naming. First, **a box gets sealed in two places**: inside the loop, when the *next* row forces a cut — and once more *after* the loop, because the final box has no "next row" to trigger it. Miss that tail seal and the last stream's rows vanish. Second, the 2 MiB cap is **soft**: the size is checked *before* the current row goes in, so a block can overshoot by one row, and `EstimatedJSONRowLen` is a cheap arithmetic guess at the row's JSON size — not the real compressed bytes, which nobody knows until the sealer runs.
+
+<Figure caption="Two seal sites. Across the five iterations, exactly one cut happens inside the loop (at i3, when the stream changes) — sealing block 0. The final box, holding i3 and i4, is never triggered by a 'next row', so the unconditional seal after the loop closes it as block 1. Seal-on-cut inside; seal-the-last-one after.">
+  <svg viewBox="0 0 720 168" role="img" aria-label="The two block-sealing sites across the loop" style="width:100%;height:auto">
+    <defs>
+      <filter id="p17" x="-3%" y="-10%" width="106%" height="120%"><feTurbulence type="fractalNoise" baseFrequency="0.013" numOctaves="2" seed="43" result="n"/><feDisplacementMap in="SourceGraphic" in2="n" scale="1.5"/></filter>
+      <marker id="p17a" markerWidth="9" markerHeight="9" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" style="fill:var(--ink-soft)"/></marker>
+    </defs>
+    <g filter="url(#p17)">
+      <line x1="40" y1="70" x2="612" y2="70" style="stroke:var(--line);stroke-width:1.6" marker-end="url(#p17a)"/>
+      <circle cx="70" cy="70" r="5" style="fill:var(--accent2)"/>
+      <circle cx="170" cy="70" r="5" style="fill:var(--accent2)"/>
+      <circle cx="270" cy="70" r="5" style="fill:var(--accent2)"/>
+      <circle cx="370" cy="70" r="7" style="fill:var(--rollback)"/>
+      <circle cx="470" cy="70" r="5" style="fill:var(--ink-soft)"/>
+      <line x1="370" y1="70" x2="370" y2="40" style="stroke:var(--rollback);stroke-width:1.6"/>
+      <line x1="636" y1="70" x2="636" y2="40" style="stroke:var(--accent2);stroke-width:1.6"/>
+      <circle cx="636" cy="70" r="7" style="fill:var(--accent2)"/>
+    </g>
+    <text x="70" y="92" text-anchor="middle" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:10px">i0</text>
+    <text x="170" y="92" text-anchor="middle" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:10px">i1</text>
+    <text x="270" y="92" text-anchor="middle" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:10px">i2</text>
+    <text x="370" y="92" text-anchor="middle" style="fill:var(--rollback);font-family:var(--font-mono);font-size:10px">i3</text>
+    <text x="470" y="92" text-anchor="middle" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:10px">i4</text>
+    <text x="370" y="32" text-anchor="middle" style="fill:var(--rollback);font-family:var(--font-hand);font-size:12px">cut → seal block 0</text>
+    <text x="636" y="32" text-anchor="middle" style="fill:var(--accent2);font-family:var(--font-hand);font-size:12px">tail → seal block 1</text>
+    <text x="636" y="92" text-anchor="middle" style="fill:var(--accent2);font-family:var(--font-mono);font-size:10px">end</text>
+    <text x="360" y="138" text-anchor="middle" style="fill:var(--ink-soft);font-family:var(--font-hand);font-size:12px">one cut inside the loop, one mandatory seal after it</text>
+  </svg>
+</Figure>
+
+The sealer, `bsw`, was pointed at the part (`mp`) before the loop even started — so each sealed block is streamed straight into the part's in-memory buffers. When the loop ends, one last call finalizes the part's header.
+
+### What's inside the part header
+
+```go
+bsw.Finalize(&mp.ph)
+```
+
+That writes the `partHeader` — the whole self-description of a part, and it's only eight fields:
+
+```go
+type partHeader struct {
+	FormatVersion          uint    // which on-disk layout (latest = 3)
+	CompressedSizeBytes    uint64  // physical size on disk
+	UncompressedSizeBytes  uint64  // original size of the log entries
+	RowsCount              uint64  // how many log entries
+	BlocksCount            uint64  // how many blocks
+	MinTimestamp           int64   // earliest timestamp in the part
+	MaxTimestamp           int64   // latest timestamp in the part
+	BloomValuesShardsCount uint64  // how many (bloom, values) shards
+}
+```
+
+<Figure caption="The eight fields of a part header, by job. Two are the 'decoder ring' (format version, shard count) that say how to read the part; two are sizes; two are counts. The last two — the timestamp range — are the coarse skip filter. Note what is NOT here: there is no streamID range. A part can be skipped by time from its header, but stream-based skipping lives one level deeper, in the per-block index.">
+  <svg viewBox="0 0 720 240" role="img" aria-label="The eight partHeader fields grouped by purpose" style="width:100%;height:auto">
+    <defs>
+      <filter id="p18" x="-3%" y="-6%" width="106%" height="112%"><feTurbulence type="fractalNoise" baseFrequency="0.012" numOctaves="2" seed="45" result="n"/><feDisplacementMap in="SourceGraphic" in2="n" scale="1.5"/></filter>
+    </defs>
+    <g filter="url(#p18)">
+      <rect x="20" y="40" width="166" height="106" rx="10" style="fill:var(--panel);stroke:var(--line);stroke-width:1.5"/>
+      <rect x="198" y="40" width="166" height="106" rx="10" style="fill:var(--panel);stroke:var(--line);stroke-width:1.5"/>
+      <rect x="376" y="40" width="150" height="106" rx="10" style="fill:var(--panel);stroke:var(--line);stroke-width:1.5"/>
+      <rect x="538" y="40" width="162" height="106" rx="10" style="fill:color-mix(in srgb,var(--accent2) 12%,var(--panel));stroke:var(--accent2);stroke-width:1.9"/>
+    </g>
+    <text x="103" y="60" text-anchor="middle" style="fill:var(--ink);font-family:var(--font-hand);font-size:13px;font-weight:700">decoder ring</text>
+    <text x="103" y="88" text-anchor="middle" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:10px">FormatVersion</text>
+    <text x="103" y="108" text-anchor="middle" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:10px">BloomValues</text>
+    <text x="103" y="124" text-anchor="middle" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:10px">ShardsCount</text>
+    <text x="281" y="60" text-anchor="middle" style="fill:var(--ink);font-family:var(--font-hand);font-size:13px;font-weight:700">sizes</text>
+    <text x="281" y="90" text-anchor="middle" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:10px">Compressed</text>
+    <text x="281" y="112" text-anchor="middle" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:10px">Uncompressed</text>
+    <text x="451" y="60" text-anchor="middle" style="fill:var(--ink);font-family:var(--font-hand);font-size:13px;font-weight:700">counts</text>
+    <text x="451" y="90" text-anchor="middle" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:10px">RowsCount</text>
+    <text x="451" y="112" text-anchor="middle" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:10px">BlocksCount</text>
+    <text x="619" y="60" text-anchor="middle" style="fill:var(--accent2);font-family:var(--font-hand);font-size:13px;font-weight:700">time range</text>
+    <text x="619" y="90" text-anchor="middle" style="fill:var(--ink);font-family:var(--font-mono);font-size:10px">MinTimestamp</text>
+    <text x="619" y="112" text-anchor="middle" style="fill:var(--ink);font-family:var(--font-mono);font-size:10px">MaxTimestamp</text>
+    <text x="619" y="134" text-anchor="middle" style="fill:var(--accent2);font-family:var(--font-mono);font-size:9px">= the skip filter</text>
+    <text x="360" y="178" text-anchor="middle" style="fill:var(--rollback);font-family:var(--font-hand);font-size:13px">no streamID range in the header — that lives in the per-block index</text>
+    <text x="360" y="208" text-anchor="middle" style="fill:var(--ink-soft);font-family:var(--font-hand);font-size:12px">the whole header is tiny, so a query reads it before touching any data</text>
+  </svg>
+</Figure>
+
+The header is written out as a tiny JSON file, `metadata.json`, and it does double duty: it's the **skip filter** (reject a part whose time range misses the query) *and* the **"how to parse me" descriptor** (the `FormatVersion` tells the reader which layout to expect; versions above what it knows are rejected). The `BloomValuesShardsCount` records how many `(bloom, values)` shard files to open — **1** for the in-memory part built here, up to 128 for a merged file part.
+
+And the part is a *directory*. Here is everything in it, by role:
+
+<Figure caption="A part on disk is a directory. metadata.json is the header (and the completeness marker). The rest are .bin files grouped by role: the index (which is where per-block streamID and time live), the per-block column metadata, and the columnar data — with the special _msg column getting its own message_* files, and all other columns sharing bloom.bin0 / values.bin0 (one shard, because this is an in-memory part). What's inside those .bin files is the next post's subject.">
+  <svg viewBox="0 0 720 316" role="img" aria-label="The files inside a part directory" style="width:100%;height:auto">
+    <defs>
+      <filter id="p19" x="-3%" y="-5%" width="106%" height="110%"><feTurbulence type="fractalNoise" baseFrequency="0.012" numOctaves="2" seed="47" result="n"/><feDisplacementMap in="SourceGraphic" in2="n" scale="1.5"/></filter>
+    </defs>
+    <g filter="url(#p19)">
+      <rect x="20" y="36" width="680" height="264" rx="12" style="fill:var(--panel);stroke:var(--line);stroke-width:1.5"/>
+      <rect x="40" y="56" width="300" height="30" rx="6" style="fill:color-mix(in srgb,var(--accent2) 14%,var(--panel));stroke:var(--accent2);stroke-width:1.7"/>
+      <rect x="40" y="104" width="320" height="80" rx="8" style="fill:var(--panel);stroke:var(--line);stroke-width:1.3"/>
+      <rect x="40" y="200" width="320" height="52" rx="8" style="fill:var(--panel);stroke:var(--line);stroke-width:1.3"/>
+      <rect x="380" y="104" width="300" height="148" rx="8" style="fill:var(--panel);stroke:var(--line);stroke-width:1.3"/>
+    </g>
+    <text x="34" y="30" style="fill:var(--ink);font-family:var(--font-hand);font-size:13px;font-weight:700">part/</text>
+    <text x="56" y="76" style="fill:var(--accent2);font-family:var(--font-mono);font-size:12px;font-weight:700">metadata.json</text>
+    <text x="214" y="76" style="fill:var(--ink-soft);font-family:var(--font-hand);font-size:11px">← the header</text>
+    <text x="52" y="100" style="fill:var(--ink-soft);font-family:var(--font-hand);font-size:11px">INDEX (stream + time skip)</text>
+    <text x="56" y="126" style="fill:var(--ink);font-family:var(--font-mono);font-size:10px">metaindex.bin · index.bin</text>
+    <text x="56" y="148" style="fill:var(--ink);font-family:var(--font-mono);font-size:10px">column_names.bin</text>
+    <text x="56" y="170" style="fill:var(--ink);font-family:var(--font-mono);font-size:10px">column_idxs.bin</text>
+    <text x="52" y="198" style="fill:var(--ink-soft);font-family:var(--font-hand);font-size:11px">COLUMN META</text>
+    <text x="56" y="224" style="fill:var(--ink);font-family:var(--font-mono);font-size:10px">columns_header_index.bin</text>
+    <text x="56" y="244" style="fill:var(--ink);font-family:var(--font-mono);font-size:10px">columns_header.bin</text>
+    <text x="392" y="100" style="fill:var(--ink-soft);font-family:var(--font-hand);font-size:11px">COLUMNAR DATA</text>
+    <text x="396" y="126" style="fill:var(--ink);font-family:var(--font-mono);font-size:10px">timestamps.bin</text>
+    <text x="396" y="150" style="fill:var(--accent2);font-family:var(--font-mono);font-size:10px">message_values.bin · message_bloom.bin</text>
+    <text x="396" y="166" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:9px">the special _msg column's own files</text>
+    <text x="396" y="192" style="fill:var(--ink);font-family:var(--font-mono);font-size:10px">bloom.bin0 · values.bin0</text>
+    <text x="396" y="208" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:9px">all other columns — one shard (in-memory part)</text>
+    <text x="396" y="236" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:9px">(a merged file part: bloom.bin0 … bloom.bin127)</text>
+  </svg>
+</Figure>
+
+The payoff of all this bookkeeping: the in-memory part built by the loop has one buffer for *each* of these files. Writing it to disk is just a matter of emptying each buffer into its file — which is the last move.
+
+### Freezing the part to disk
+
+```go
+func (mp *inmemoryPart) MustStoreToDisk(path string) {
+	fs.MustMkdirFailIfExist(path)                      // 1. create the dir (must not exist)
+
+	var psw filestream.ParallelStreamWriter
+	psw.Add(".../timestamps.bin", &mp.timestamps)      // 2. pair every buffer with its file
+	psw.Add(".../index.bin",      &mp.index)
+	// ... all the others, _msg to message_*, the rest to bloom.bin0 / values.bin0 ...
+	psw.Run()                                          // 3. write them all, in parallel
+
+	mp.ph.mustWriteMetadata(path)                      // 4. write metadata.json LAST
+
+	fs.MustSyncPathAndParentDir(path)                  // 5. fsync the dir, for durability
+}
+```
+
+Each step earns its place. The directory is created with `MustMkdirFailIfExist` — it **panics if the directory already exists**, which is immutability made physical: a part directory is written once and never reopened. Each in-memory buffer is paired with its filename (the 1:1 map from the previous section) and all the files are written **in parallel**, because on networked storage serial writes are slow. Then — and this ordering is the whole durability story — `metadata.json` is written **last**, and the directory is fsynced.
+
+<Figure caption="Why metadata.json goes last. The data files are written first; metadata.json — the part's 'I'm complete' marker, without which the part cannot even be opened — is written only after. So a crash mid-write leaves a directory with no usable metadata.json, which is simply ignored; a crash after it leaves a fully valid part. Data first, commit marker last: the part appears atomically. The final fsync makes the new directory survive a power loss.">
+  <svg viewBox="0 0 720 196" role="img" aria-label="metadata.json written last gives atomic publish" style="width:100%;height:auto">
+    <defs>
+      <filter id="p20" x="-3%" y="-8%" width="106%" height="116%"><feTurbulence type="fractalNoise" baseFrequency="0.013" numOctaves="2" seed="49" result="n"/><feDisplacementMap in="SourceGraphic" in2="n" scale="1.5"/></filter>
+      <marker id="p20a" markerWidth="9" markerHeight="9" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" style="fill:var(--ink-soft)"/></marker>
+    </defs>
+    <g filter="url(#p20)">
+      <rect x="30" y="64" width="150" height="46" rx="9" style="fill:var(--panel);stroke:var(--line);stroke-width:1.5"/>
+      <rect x="232" y="64" width="150" height="46" rx="9" style="fill:color-mix(in srgb,var(--accent2) 12%,var(--panel));stroke:var(--accent2);stroke-width:1.8"/>
+      <rect x="434" y="64" width="120" height="46" rx="9" style="fill:var(--panel);stroke:var(--line);stroke-width:1.5"/>
+      <line x1="180" y1="87" x2="228" y2="87" style="stroke:var(--ink-soft);stroke-width:1.6" marker-end="url(#p20a)"/>
+      <line x1="382" y1="87" x2="430" y2="87" style="stroke:var(--ink-soft);stroke-width:1.6" marker-end="url(#p20a)"/>
+      <line x1="140" y1="118" x2="140" y2="150" style="stroke:var(--rollback);stroke-width:1.6"/>
+      <line x1="307" y1="118" x2="307" y2="150" style="stroke:var(--accent2);stroke-width:1.6"/>
+    </g>
+    <text x="105" y="52" text-anchor="middle" style="fill:var(--ink-soft);font-family:var(--font-hand);font-size:11px">1 · data files</text>
+    <text x="105" y="91" text-anchor="middle" style="fill:var(--ink);font-family:var(--font-mono);font-size:11px">*.bin (parallel)</text>
+    <text x="307" y="52" text-anchor="middle" style="fill:var(--accent2);font-family:var(--font-hand);font-size:11px">2 · commit marker</text>
+    <text x="307" y="91" text-anchor="middle" style="fill:var(--ink);font-family:var(--font-mono);font-size:11px">metadata.json</text>
+    <text x="494" y="52" text-anchor="middle" style="fill:var(--ink-soft);font-family:var(--font-hand);font-size:11px">3 · fsync</text>
+    <text x="494" y="91" text-anchor="middle" style="fill:var(--ink);font-family:var(--font-mono);font-size:11px">dir + parent</text>
+    <text x="140" y="168" text-anchor="middle" style="fill:var(--rollback);font-family:var(--font-hand);font-size:11px">crash here → no metadata → ignored</text>
+    <text x="307" y="168" text-anchor="middle" style="fill:var(--accent2);font-family:var(--font-hand);font-size:11px">crash here → part is valid</text>
+  </svg>
+</Figure>
+
+And that is the freeze. After `MustStoreToDisk` returns, a real, immutable part directory exists on disk — `metadata.json` and its `.bin` files — and the engine swaps it in for the in-memory original (how that swap happens, and how these parts later get merged, is the next post). The row has finished its journey: ingested, buffered, sorted, cut into blocks, and frozen into a part on disk.
+
+### See it on disk
+
+Everything above is a claim about code. Let's make a real part and look at it. Build the single-node binary, start it with a one-second flush interval so parts hit disk quickly, and ingest five lines across two streams (`service` is the stream field):
+
+```bash
+go build -o victoria-logs ./app/victoria-logs
+./victoria-logs -storageDataPath=./vldata -inmemoryDataFlushInterval=1s &
+
+printf '%s\n' \
+  '{"service":"api","level":"info","_msg":"GET /x"}' \
+  '{"service":"api","level":"info","_msg":"GET /"}' \
+  '{"service":"api","level":"error","_msg":"500 err"}' \
+  '{"service":"db","level":"info","_msg":"boot"}' \
+  '{"service":"db","level":"warn","_msg":"disk hot"}' \
+| curl -s 'http://localhost:9428/insert/jsonline?_stream_fields=service' \
+    -H 'Content-Type: application/stream+json' --data-binary @-
+```
+
+Three `api` rows, two `db` rows — so two streams. Wait a second for the flush, then look at what landed under `./vldata`:
+
+```
+partitions/20261106/
+├── datadb/
+│   └── 18E58FA33A8DE671/          ← one part: an immutable directory
+│       ├── metadata.json              the part header
+│       ├── timestamps.bin
+│       ├── index.bin   metaindex.bin  the index (per-block stream + time)
+│       ├── column_names.bin   column_idxs.bin
+│       ├── columns_header.bin  columns_header_index.bin
+│       ├── message_bloom.bin   message_values.bin   ← _msg's own files
+│       └── bloom.bin0   values.bin0                 ← every other column, ONE shard
+│   └── parts.json
+└── indexdb/ …                     the second LSM tree — the stream index (a later post)
+```
+
+Every file we predicted is there — the header, the timestamps column, the index, the per-block column metadata, `_msg`'s dedicated `message_*` files, and `bloom.bin0` / `values.bin0` for the rest. The directory name (`20261106`) is the day: partitions are per-day (also a later post). Now the header itself:
+
+```json
+{"FormatVersion":3,"CompressedSizeBytes":334,"UncompressedSizeBytes":474,
+ "RowsCount":5,"BlocksCount":2,
+ "MinTimestamp":1793997957780798000,"MaxTimestamp":1793997957780830000,
+ "BloomValuesShardsCount":1}
+```
+
+Read it against everything this chapter claimed:
+
+<Figure caption="The real metadata.json, checked against the chapter. Five rows became two blocks — one per stream — exactly as the cutting loop promised. The header is eight fields: a format version, two sizes, two counts, and a timestamp range. There is a time range and nothing else to skip by — no streamID range, confirming it lives in the index, not the header. And the shard count is 1, which is why the file on disk is literally bloom.bin0.">
+  <svg viewBox="0 0 720 250" role="img" aria-label="Verification checklist against the real part header" style="width:100%;height:auto">
+    <defs>
+      <filter id="p21" x="-3%" y="-5%" width="106%" height="110%"><feTurbulence type="fractalNoise" baseFrequency="0.012" numOctaves="2" seed="51" result="n"/><feDisplacementMap in="SourceGraphic" in2="n" scale="1.4"/></filter>
+    </defs>
+    <g filter="url(#p21)">
+      <rect x="20" y="26" width="680" height="200" rx="12" style="fill:var(--panel);stroke:var(--line);stroke-width:1.5"/>
+      <circle cx="48" cy="60" r="10" style="fill:var(--accent2)"/>
+      <circle cx="48" cy="104" r="10" style="fill:var(--accent2)"/>
+      <circle cx="48" cy="148" r="10" style="fill:var(--accent2)"/>
+      <circle cx="48" cy="192" r="10" style="fill:var(--accent2)"/>
+    </g>
+    <text x="48" y="64" text-anchor="middle" style="fill:var(--panel);font-family:var(--font-hand);font-size:12px;font-weight:700">✓</text>
+    <text x="48" y="108" text-anchor="middle" style="fill:var(--panel);font-family:var(--font-hand);font-size:12px;font-weight:700">✓</text>
+    <text x="48" y="152" text-anchor="middle" style="fill:var(--panel);font-family:var(--font-hand);font-size:12px;font-weight:700">✓</text>
+    <text x="48" y="196" text-anchor="middle" style="fill:var(--panel);font-family:var(--font-hand);font-size:12px;font-weight:700">✓</text>
+    <text x="72" y="56" style="fill:var(--ink);font-family:var(--font-hand);font-size:14px;font-weight:700">RowsCount 5 → BlocksCount 2</text>
+    <text x="72" y="74" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:11px">one block per stream (2 streams), neither near 2 MiB</text>
+    <text x="72" y="100" style="fill:var(--ink);font-family:var(--font-hand);font-size:14px;font-weight:700">a timestamp range, and only that</text>
+    <text x="72" y="118" style="fill:var(--rollback);font-family:var(--font-mono);font-size:11px">no streamID range in the header — it lives in index.bin</text>
+    <text x="72" y="144" style="fill:var(--ink);font-family:var(--font-hand);font-size:14px;font-weight:700">BloomValuesShardsCount 1</text>
+    <text x="72" y="162" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:11px">an in-memory part → one shard → the file is bloom.bin0</text>
+    <text x="72" y="188" style="fill:var(--ink);font-family:var(--font-hand);font-size:14px;font-weight:700">FormatVersion 3</text>
+    <text x="72" y="206" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:11px">the current on-disk layout — the reader's decoder ring</text>
+  </svg>
+</Figure>
+
+Five rows in, two blocks out, one per stream. A header that is pure time range and counts. A single bloom/values shard named `bloom.bin0`. A format version of 3. The sort, the cut, and the freeze are not a story — they are sitting in `./vldata`, and you can `cat` them.
+
+### What you now know
+
+<ol class="steps">
+  <li>Post 1 ends with a buffer of typed rows in **arrival order**; this post turns it into an immutable part on disk, in three moves.</li>
+  <li><strong>Sort</strong> by <code>(streamID, timestamp)</code> — really <code>(tenantID, streamHash, timestamp)</code> — so each stream becomes one contiguous, time-ordered run. The sort is cheap because the buffer is a structure-of-arrays: swapping rows moves tiny headers, never the field bytes. A second sort puts each row's fields in canonical name order.</li>
+  <li><strong>Cut</strong> the sorted rows into <strong>blocks</strong>: one loop, a fresh block whenever the stream changes or the box hits 2 MiB, with a mandatory seal for the final box.</li>
+  <li>Each block is sealed into the part; <code>Finalize</code> writes the <strong>part header</strong> — eight fields, a <em>time</em> range (no streamID range — that's in the per-block index), persisted as <code>metadata.json</code>.</li>
+  <li>A part is a <strong>directory</strong> of <code>metadata.json</code> plus <code>.bin</code> files; the in-memory part has one buffer per file.</li>
+  <li><strong>Freeze</strong>: <code>MustStoreToDisk</code> writes those buffers out in parallel, <code>metadata.json</code> last, then fsyncs — an atomic, durable, write-once part.</li>
+  <li><strong>And it checks out on disk</strong>: 5 rows → 2 blocks (one per stream), <code>FormatVersion 3</code>, one bloom/values shard (<code>bloom.bin0</code>), a timestamp range and no streamID range — exactly as claimed.</li>
+</ol>
+
+The row is now a sorted, immutable, file-backed part — the unit every later post operates on. But each flush makes a *new* part, so a busy server piles up thousands of tiny ones. The next chapter is the engine that tames them: the in-memory buffer and the background **merge** that folds many small parts into fewer big ones — the heart of the LSM design.

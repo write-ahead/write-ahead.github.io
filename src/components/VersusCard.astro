@@ -1,0 +1,32 @@
+---
+// A "tale of the tape" matchup card: VictoriaLogs vs one competitor, with the
+// claim's numbers pulled out as stat chips. The claim prose goes in the slot.
+//   <VersusCard opponent="Elasticsearch" stats={[{ big: '30×', lab: 'less RAM' }]}>
+//     Same workload. One reader replaced a <strong>27-node</strong> cluster…
+//   </VersusCard>
+interface Stat {
+  big: string;
+  lab: string;
+}
+interface Props {
+  opponent: string;
+  stats: Stat[];
+}
+const { opponent, stats } = Astro.props;
+---
+<article class="matchup">
+  <div class="vs-head">
+    <span class="side-vl">VictoriaLogs</span>
+    <span class="vs-badge">VS</span>
+    <span class="side-opp">{opponent}</span>
+  </div>
+  <div class="stat-row">
+    {stats.map((s) => (
+      <div class="stat">
+        <div class="stat-big">{s.big}</div>
+        <div class="stat-lab">{s.lab}</div>
+      </div>
+    ))}
+  </div>
+  <p class="claim"><slot /></p>
+</article>

@@ -8,7 +8,7 @@ interface Props {
   description?: string;
   /** social-share image: a path (in public/) or a full URL. Defaults to the site card. */
   image?: string;
-  /** Open Graph type: 'website' for landing pages, 'article' for a chapter. */
+  /** Open Graph type: 'website' for landing pages, 'article' for a post. */
   type?: 'website' | 'article';
 }
 const {
@@ -28,6 +28,17 @@ const ogImageURL = new URL(image ?? '/og-default.png', Astro.site);
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    {/* Apply the saved theme before first paint to avoid a flash of the wrong one. */}
+    <script is:inline>
+      (function () {
+        try {
+          var t = localStorage.getItem('wa-theme');
+          if (t === 'light' || t === 'dark') {
+            document.documentElement.setAttribute('data-theme', t);
+          }
+        } catch (e) {}
+      })();
+    </script>
     <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
     <title>{title}</title>
     <meta name="description" content={description} />
@@ -75,9 +86,13 @@ const ogImageURL = new URL(image ?? '/og-default.png', Astro.site);
           <span>Write-Ahead</span>
         </a>
         <nav>
-          <a href="/">The Book</a>
+          <a href="/">The Log</a>
           <a href="/tags">Topics</a>
           <a href="/about">About</a>
+          <button id="theme-toggle" class="theme-toggle" type="button" aria-label="Toggle dark mode" title="Toggle light / dark">
+            <svg class="icon-sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="4.2"/><path d="M12 2v2.5M12 19.5V22M4.2 4.2l1.8 1.8M18 18l1.8 1.8M2 12h2.5M19.5 12H22M4.2 19.8 6 18M18 6l1.8-1.8"/></svg>
+            <svg class="icon-moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20.5 14.5A8 8 0 1 1 9.5 3.5a6.3 6.3 0 0 0 11 11z"/></svg>
+          </button>
         </nav>
         <Search client:idle />
       </header>
@@ -150,8 +165,121 @@ const ogImageURL = new URL(image ?? '/og-default.png', Astro.site);
       if (window.matchMedia) {
         window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', sketchFrames);
       }
+      // Web fonts (the hand-drawn display face) load async and change text
+      // height after first paint — redraw once they're ready so borders fit.
+      if (document.fonts?.ready) {
+        document.fonts.ready.then(sketchFrames);
+      }
+      // And redraw any framed box whenever its own size changes (late layout
+      // shifts, images, wrapping) so the sketch border always matches.
+      if ('ResizeObserver' in window) {
+        const ro = new ResizeObserver(schedule);
+        document
+          .querySelectorAll<HTMLElement>('[data-sketch-frame]')
+          .forEach((el) => ro.observe(el));
+      }
       // run once in case 'load' already fired
       sketchFrames();
+
+      /* ---- "commit to clipboard": a copy button on every code snippet.
+         Success reads "committed" — a nod to the write-ahead log this blog is about. ---- */
+      const CLIP =
+        '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="8" y="3.5" width="12" height="15" rx="2"/><path d="M8 6.5H6a2 2 0 0 0-2 2v10a2 2 0 0 0 2 2h8a2 2 0 0 0 2-2v-1"/></svg>';
+      const TICK =
+        '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg>';
+      const COPY_IDLE = `${CLIP}<span>copy</span>`;
+
+      function legacyCopy(text: string): boolean {
+        try {
+          const ta = document.createElement('textarea');
+          ta.value = text;
+          ta.style.position = 'fixed';
+          ta.style.top = '-9999px';
+          ta.style.opacity = '0';
+          document.body.appendChild(ta);
+          ta.select();
+          const ok = document.execCommand('copy');
+          document.body.removeChild(ta);
+          return ok;
+        } catch {
+          return false;
+        }
+      }
+
+      function addCopyButtons() {
+        document.querySelectorAll<HTMLPreElement>('.prose pre').forEach((pre) => {
+          // wrap once so the button can pin to a non-scrolling box
+          let wrap = pre.parentElement;
+          if (!wrap || !wrap.classList.contains('codewrap')) {
+            wrap = document.createElement('div');
+            wrap.className = 'codewrap';
+            pre.replaceWith(wrap);
+            wrap.appendChild(pre);
+          }
+          if (wrap.querySelector(':scope > .copy-btn')) return;
+
+          const code = pre.querySelector('code');
+          const btn = document.createElement('button');
+          btn.type = 'button';
+          btn.className = 'copy-btn';
+          btn.setAttribute('aria-label', 'Copy snippet to clipboard');
+          btn.innerHTML = COPY_IDLE;
+
+          let copyTimer: number | undefined;
+          btn.addEventListener('click', async () => {
+            const text = (code?.textContent ?? pre.textContent ?? '').replace(/\n+$/, '');
+            let ok = false;
+            try {
+              if (navigator.clipboard?.writeText) {
+                await navigator.clipboard.writeText(text);
+                ok = true;
+              } else {
+                ok = legacyCopy(text);
+              }
+            } catch {
+              ok = legacyCopy(text);
+            }
+
+            window.clearTimeout(copyTimer);
+            btn.classList.remove('is-done', 'is-fail');
+            if (ok) {
+              btn.classList.add('is-done');
+              btn.innerHTML = `${TICK}<span>committed</span>`;
+            } else {
+              btn.classList.add('is-fail');
+              btn.innerHTML = `${CLIP}<span>press ⌘C</span>`;
+            }
+            copyTimer = window.setTimeout(() => {
+              btn.classList.remove('is-done', 'is-fail');
+              btn.innerHTML = COPY_IDLE;
+            }, 1800);
+          });
+
+          wrap.appendChild(btn);
+        });
+      }
+
+      window.addEventListener('load', addCopyButtons);
+      addCopyButtons();
+
+      /* ---- light / dark toggle ---- */
+      const themeBtn = document.getElementById('theme-toggle');
+      if (themeBtn) {
+        themeBtn.addEventListener('click', () => {
+          const root = document.documentElement;
+          const explicit = root.getAttribute('data-theme');
+          const systemDark =
+            !!window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches;
+          const isDark = explicit ? explicit === 'dark' : systemDark;
+          const next = isDark ? 'light' : 'dark';
+          root.setAttribute('data-theme', next);
+          try {
+            localStorage.setItem('wa-theme', next);
+          } catch {}
+          // colors changed — redraw the hand-drawn borders in the new palette
+          sketchFrames();
+        });
+      }
     </script>
   </body>
 </html>

@@ -1,0 +1,1021 @@
+---
+title: "VictoriaLogs storage internals: How the logs get in"
+description: The opening post of the series. We draw the map — the flat data model, the stream (a hash of the fields you choose, not a property of the log line), and the two LSM trees per day — then watch it all land on disk, file by file.
+pubDate: 2026-11-10
+order: 1
+part: Log storage
+path: victorialogs/internals/storage-engine/how-line-gets-in
+tags: ['log storage', 'victorialogs', 'data model']
+status: soon
+---
+
+import StreamBuilder from '../../components/StreamBuilder.tsx';
+import ContainmentTree from '../../components/ContainmentTree.tsx';
+import RowsToBlocks from '../../components/RowsToBlocks.tsx';
+import PartAnatomy from '../../components/PartAnatomy.tsx';
+import Annotate from '../../components/Annotate.tsx';
+import VersusCard from '../../components/VersusCard.astro';
+import Table from '../../components/Table.astro';
+import Figure from '../../components/Figure.astro';
+import MarginNote from '../../components/MarginNote.astro';
+
+### Naive log storage 
+
+lets imagine a naive log storage , we will call it naive-log 
+
+the naive-log would not be a strawamn, otherwise every solution the real victoria log gives for 
+the naive-log problem would feel manufactured.
+
+the naive-log would be something which could exist in real life as well as a solution for tiny scale logging.
+This way we would really get to know the limitation of naive-log storage and how victoria logs solves it.
+
+consider the following code for the naive-log
+
+//Todo-claude= put following code snippet in the code block
+
+```go
+// Append: O(1) amortized. Just bytes on the end of a file.
+func Append(f *os.File, fields map[string]string) error {
+	b, _ := json.Marshal(fields)
+	_, err := f.Write(append(b, '\n'))
+	return err
+}
+
+// Query: read the WHOLE file, parse EVERY line, filter in memory.
+func Scan(path string, min, max time.Time, match map[string]string) ([]map[string]string, error) {
+	f, _ := os.Open(path)
+	defer f.Close()
+	var out []map[string]string
+	sc := bufio.NewScanner(f)
+	for sc.Scan() {                              // (1) no skipping — reads every byte
+		var row map[string]string
+		json.Unmarshal(sc.Bytes(), &row)        // (2) parses every field to check one
+		t, _ := time.Parse(time.RFC3339, row["_time"])
+		if t.Before(min) || t.After(max) {
+			continue
+		}
+		ok := true
+		for k, v := range match {
+			if row[k] != v {                    // (3) compares after full parse — no value index
+				ok = false
+				break
+			}
+		}
+		if ok {
+			out = append(out, row)
+		}
+	}
+	return out, sc.Err()
+}
+```
+
+
+the log comes in and is simply appended to the storage file on the disk.
+
+and when we need to query for anything we need to scan the whole file because there is no index which could provide a sublinear path to the thing being searched for 
+
+//Todo-claude= put a good illustration here showing the working of naive-log storage in detail 
+
+<Figure caption="naive-log is one flat file. Every source appends its JSON line to the end (O(1), no coordination), so lines land in arrival order — which is only roughly time-ordered (note the late 09:02 at the bottom). There is no index of any kind, so every read has to march through all N lines.">
+  <svg viewBox="0 0 720 300" role="img" aria-label="Naive append-only log file" style="width:100%;height:auto">
+    <defs><filter id="rl1" x="-4%" y="-8%" width="108%" height="116%"><feTurbulence type="fractalNoise" baseFrequency="0.013" numOctaves="2" seed="7" result="n"/><feDisplacementMap in="SourceGraphic" in2="n" scale="1.8"/></filter><marker id="ah1" markerWidth="9" markerHeight="9" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" style="fill:var(--ink-soft)"/></marker></defs>
+    <g filter="url(#rl1)">
+      <rect x="20" y="58" width="128" height="40" rx="8" style="fill:var(--panel);stroke:var(--accent);stroke-width:1.8"/>
+      <rect x="20" y="130" width="128" height="40" rx="8" style="fill:var(--panel);stroke:var(--accent);stroke-width:1.8"/>
+      <rect x="20" y="202" width="128" height="40" rx="8" style="fill:var(--panel);stroke:var(--accent);stroke-width:1.8"/>
+      <line x1="148" y1="78" x2="205" y2="120" style="stroke:var(--ink-soft);stroke-width:1.6;fill:none" marker-end="url(#ah1)"/>
+      <line x1="148" y1="150" x2="205" y2="150" style="stroke:var(--ink-soft);stroke-width:1.6;fill:none" marker-end="url(#ah1)"/>
+      <line x1="148" y1="222" x2="205" y2="180" style="stroke:var(--ink-soft);stroke-width:1.6;fill:none" marker-end="url(#ah1)"/>
+      <rect x="210" y="24" width="300" height="252" rx="10" style="fill:var(--panel);stroke:var(--line);stroke-width:1.5"/>
+      <line x1="210" y1="58" x2="510" y2="58" style="stroke:var(--line);stroke-width:1.2"/>
+      <rect x="226" y="70" width="268" height="26" rx="4" style="fill:var(--panel);stroke:var(--line);stroke-width:1.2"/>
+      <rect x="226" y="102" width="268" height="26" rx="4" style="fill:var(--panel);stroke:var(--line);stroke-width:1.2"/>
+      <rect x="226" y="134" width="268" height="26" rx="4" style="fill:var(--panel);stroke:var(--line);stroke-width:1.2"/>
+      <rect x="226" y="166" width="268" height="26" rx="4" style="fill:var(--panel);stroke:var(--line);stroke-width:1.2"/>
+      <rect x="226" y="198" width="268" height="26" rx="4" style="fill:var(--panel);stroke:var(--line);stroke-width:1.2"/>
+      <rect x="226" y="230" width="268" height="26" rx="4" style="fill:color-mix(in srgb,var(--rollback) 14%,var(--panel));stroke:var(--rollback);stroke-width:1.4"/>
+      <line x1="534" y1="70" x2="534" y2="256" style="stroke:var(--accent2);stroke-width:1.8;fill:none"/>
+      <line x1="534" y1="70" x2="526" y2="70" style="stroke:var(--accent2);stroke-width:1.8"/>
+      <line x1="534" y1="256" x2="526" y2="256" style="stroke:var(--accent2);stroke-width:1.8"/>
+    </g>
+    <text x="84" y="83" text-anchor="middle" style="fill:var(--ink);font-family:var(--font-mono);font-size:12px">svc=api</text>
+    <text x="84" y="155" text-anchor="middle" style="fill:var(--ink);font-family:var(--font-mono);font-size:12px">svc=worker</text>
+    <text x="84" y="227" text-anchor="middle" style="fill:var(--ink);font-family:var(--font-mono);font-size:12px">svc=db</text>
+    <text x="360" y="47" text-anchor="middle" style="fill:var(--ink);font-family:var(--font-hand);font-size:15px;font-weight:700">naive-log.jsonl</text>
+    <text x="236" y="88" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:11px">_time=09:01  svc=api  level=info</text>
+    <text x="236" y="120" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:11px">_time=09:04  svc=db   level=warn</text>
+    <text x="236" y="152" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:11px">_time=09:02  svc=api  level=error</text>
+    <text x="236" y="184" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:11px">_time=09:05  svc=worker level=info</text>
+    <text x="236" y="216" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:11px">_time=09:03  svc=db   level=info</text>
+    <text x="236" y="248" style="fill:var(--rollback);font-family:var(--font-mono);font-size:11px">_time=09:02  svc=api  (late arrival)</text>
+    <text x="548" y="150" style="fill:var(--accent2);font-family:var(--font-hand);font-size:13px">every query</text>
+    <text x="548" y="168" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:11px">reads ALL</text>
+    <text x="548" y="184" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:11px">N lines</text>
+    <text x="548" y="206" style="fill:var(--rollback);font-family:var(--font-mono);font-size:12px">no index</text>
+    <text x="548" y="222" style="fill:var(--rollback);font-family:var(--font-mono);font-size:12px">⇒ O(N)</text>
+    <text x="360" y="292" text-anchor="middle" style="fill:var(--ink-soft);font-family:var(--font-hand);font-size:13px">append to the end — O(1), no sort, no coordination</text>
+  </svg>
+</Figure>
+
+### Naive-log write path - why its seductive 
+incoming log -> encode JSON -> write bytes + '\n' to the end of the file
+//Todo-claude= explain the above with illustration 
+
+<Figure caption="The entire write path: take the incoming fields, encode them to JSON, append the bytes plus a newline to the end of the file. Three steps, no bookkeeping — this is why appending feels free. The whole cost of that simplicity is pushed to read time.">
+  <svg viewBox="0 0 720 150" role="img" aria-label="Naive-log write path" style="width:100%;height:auto">
+    <defs><filter id="rl2" x="-4%" y="-14%" width="108%" height="128%"><feTurbulence type="fractalNoise" baseFrequency="0.013" numOctaves="2" seed="3" result="n"/><feDisplacementMap in="SourceGraphic" in2="n" scale="1.8"/></filter><marker id="ah2" markerWidth="9" markerHeight="9" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" style="fill:var(--ink-soft)"/></marker></defs>
+    <g filter="url(#rl2)">
+      <rect x="18" y="44" width="150" height="54" rx="10" style="fill:var(--panel);stroke:var(--accent);stroke-width:1.8"/>
+      <rect x="236" y="44" width="150" height="54" rx="10" style="fill:var(--panel);stroke:var(--line);stroke-width:1.6"/>
+      <rect x="454" y="44" width="150" height="54" rx="10" style="fill:var(--panel);stroke:var(--line);stroke-width:1.6"/>
+      <rect x="636" y="30" width="66" height="82" rx="8" style="fill:color-mix(in srgb,var(--accent2) 12%,var(--panel));stroke:var(--accent2);stroke-width:1.8"/>
+      <line x1="168" y1="71" x2="232" y2="71" style="stroke:var(--ink-soft);stroke-width:1.8;fill:none" marker-end="url(#ah2)"/>
+      <line x1="386" y1="71" x2="450" y2="71" style="stroke:var(--ink-soft);stroke-width:1.8;fill:none" marker-end="url(#ah2)"/>
+      <line x1="604" y1="71" x2="632" y2="71" style="stroke:var(--ink-soft);stroke-width:1.8;fill:none" marker-end="url(#ah2)"/>
+    </g>
+    <text x="93" y="67" text-anchor="middle" style="fill:var(--ink);font-family:var(--font-hand);font-size:14px">incoming log</text>
+    <text x="93" y="86" text-anchor="middle" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:11px">fields</text>
+    <text x="311" y="67" text-anchor="middle" style="fill:var(--ink);font-family:var(--font-hand);font-size:14px">encode JSON</text>
+    <text x="311" y="86" text-anchor="middle" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:11px">Marshal</text>
+    <text x="529" y="67" text-anchor="middle" style="fill:var(--ink);font-family:var(--font-hand);font-size:14px">bytes + '\n'</text>
+    <text x="529" y="86" text-anchor="middle" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:11px">Write()</text>
+    <text x="669" y="58" text-anchor="middle" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:10px">file</text>
+    <text x="669" y="78" text-anchor="middle" style="fill:var(--accent2);font-family:var(--font-mono);font-size:11px">end</text>
+    <text x="669" y="94" text-anchor="middle" style="fill:var(--accent2);font-family:var(--font-mono);font-size:11px">⟵</text>
+    <text x="360" y="28" text-anchor="middle" style="fill:var(--ink-soft);font-family:var(--font-hand);font-size:13px">O(1) amortized — just bytes on the end</text>
+    <text x="360" y="134" text-anchor="middle" style="fill:var(--ink-soft);font-family:var(--font-hand);font-size:13px">all the cost is deferred to read time</text>
+  </svg>
+</Figure>
+
+this is the whole appeal.Writing is trivial and fast. All the cost has been deferred to read time — and that deferred bill is the entire series.
+
+### Naive-log query path - where is collapses 
+Ask: svc=api AND level=error, time ∈ [09:00, 09:05].
+//Todo-claude= add the illustration to show how this query would be satisfied in the naive-log 
+
+<Figure caption="The query svc=api AND level=error in [09:00,09:05] touches every line: the cursor cannot skip (no order), it fully parses each line to read any field, and it compares only after parsing. Two lines match — but the work was the whole file. The answer is tiny; the cost is O(N).">
+  <svg viewBox="0 0 720 330" role="img" aria-label="Naive-log query path full scan" style="width:100%;height:auto">
+    <defs><filter id="rl3" x="-4%" y="-6%" width="108%" height="112%"><feTurbulence type="fractalNoise" baseFrequency="0.013" numOctaves="2" seed="11" result="n"/><feDisplacementMap in="SourceGraphic" in2="n" scale="1.6"/></filter><marker id="ah3" markerWidth="9" markerHeight="9" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" style="fill:var(--accent)"/></marker></defs>
+    <g filter="url(#rl3)">
+      <rect x="20" y="20" width="400" height="40" rx="10" style="fill:color-mix(in srgb,var(--accent) 12%,var(--panel));stroke:var(--accent);stroke-width:1.8"/>
+      <rect x="150" y="80" width="300" height="230" rx="10" style="fill:var(--panel);stroke:var(--line);stroke-width:1.5"/>
+      <rect x="166" y="94" width="268" height="26" rx="4" style="fill:var(--panel);stroke:var(--line);stroke-width:1.2"/>
+      <rect x="166" y="126" width="268" height="26" rx="4" style="fill:color-mix(in srgb,var(--accent2) 20%,var(--panel));stroke:var(--accent2);stroke-width:1.8"/>
+      <rect x="166" y="158" width="268" height="26" rx="4" style="fill:var(--panel);stroke:var(--line);stroke-width:1.2"/>
+      <rect x="166" y="190" width="268" height="26" rx="4" style="fill:var(--panel);stroke:var(--line);stroke-width:1.2"/>
+      <rect x="166" y="222" width="268" height="26" rx="4" style="fill:color-mix(in srgb,var(--accent2) 20%,var(--panel));stroke:var(--accent2);stroke-width:1.8"/>
+      <rect x="166" y="254" width="268" height="26" rx="4" style="fill:var(--panel);stroke:var(--line);stroke-width:1.2"/>
+      <line x1="135" y1="94" x2="135" y2="290" style="stroke:var(--accent);stroke-width:2;fill:none" marker-end="url(#ah3)"/>
+      <line x1="135" y1="107" x2="150" y2="107" style="stroke:var(--accent);stroke-width:1.4"/>
+      <line x1="135" y1="139" x2="150" y2="139" style="stroke:var(--accent);stroke-width:1.4"/>
+      <line x1="135" y1="171" x2="150" y2="171" style="stroke:var(--accent);stroke-width:1.4"/>
+      <line x1="135" y1="203" x2="150" y2="203" style="stroke:var(--accent);stroke-width:1.4"/>
+      <line x1="135" y1="235" x2="150" y2="235" style="stroke:var(--accent);stroke-width:1.4"/>
+      <line x1="135" y1="267" x2="150" y2="267" style="stroke:var(--accent);stroke-width:1.4"/>
+      <rect x="486" y="104" width="214" height="60" rx="8" style="fill:var(--panel);stroke:var(--line);stroke-width:1.4"/>
+      <rect x="486" y="180" width="214" height="60" rx="8" style="fill:var(--panel);stroke:var(--line);stroke-width:1.4"/>
+      <rect x="486" y="256" width="214" height="44" rx="8" style="fill:var(--panel);stroke:var(--rollback);stroke-width:1.6"/>
+    </g>
+    <text x="40" y="45" style="fill:var(--accent);font-family:var(--font-mono);font-size:13px">svc=api AND level=error, t in [09:00,09:05]</text>
+    <text x="300" y="79" text-anchor="middle" style="fill:var(--ink);font-family:var(--font-hand);font-size:14px">naive-log.jsonl</text>
+    <text x="176" y="111" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:11px">svc=db   level=warn</text>
+    <text x="176" y="143" style="fill:var(--ink);font-family:var(--font-mono);font-size:11px">svc=api  level=error  ✓</text>
+    <text x="176" y="175" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:11px">svc=api  level=info</text>
+    <text x="176" y="207" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:11px">svc=worker level=error</text>
+    <text x="176" y="239" style="fill:var(--ink);font-family:var(--font-mono);font-size:11px">svc=api  level=error  ✓</text>
+    <text x="176" y="271" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:11px">svc=db   level=info</text>
+    <text x="100" y="315" text-anchor="middle" style="fill:var(--accent);font-family:var(--font-hand);font-size:12px">cursor: no skip</text>
+    <text x="593" y="128" text-anchor="middle" style="fill:var(--ink);font-family:var(--font-hand);font-size:13px">1 · no skipping</text>
+    <text x="593" y="148" text-anchor="middle" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:10px">reads every byte</text>
+    <text x="593" y="204" text-anchor="middle" style="fill:var(--ink);font-family:var(--font-hand);font-size:13px">2 · parse every field</text>
+    <text x="593" y="224" text-anchor="middle" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:10px">to check one</text>
+    <text x="593" y="282" text-anchor="middle" style="fill:var(--rollback);font-family:var(--font-hand);font-size:13px">3 · compare after parse</text>
+  </svg>
+</Figure>
+
+The store gets slower forever, no matter how small the answer.
+### Zoom into once log - the hidden tax 
+Even testing a single field is expensive, because the data is row-oriented and opaque:
+
+//Todo-claude= put the illustration here to explain this point in naive-log 
+
+<Figure caption="One line, stored row-oriented as opaque JSON. The query only needs `level`, but the fields are glued together in one blob — so to reach `level` the parser must walk and decode every field before it (and every field after, to know where the line ends). You pay for the whole row to read one column.">
+  <svg viewBox="0 0 720 200" role="img" aria-label="Row-oriented parse tax for one log line" style="width:100%;height:auto">
+    <defs><filter id="rl4" x="-3%" y="-10%" width="106%" height="120%"><feTurbulence type="fractalNoise" baseFrequency="0.013" numOctaves="2" seed="5" result="n"/><feDisplacementMap in="SourceGraphic" in2="n" scale="1.6"/></filter></defs>
+    <g filter="url(#rl4)">
+      <rect x="18" y="40" width="94" height="44" rx="6" style="fill:color-mix(in srgb,var(--ink-soft) 14%,var(--panel));stroke:var(--line);stroke-width:1.4"/>
+      <rect x="114" y="40" width="80" height="44" rx="6" style="fill:color-mix(in srgb,var(--ink-soft) 14%,var(--panel));stroke:var(--line);stroke-width:1.4"/>
+      <rect x="196" y="40" width="80" height="44" rx="6" style="fill:color-mix(in srgb,var(--ink-soft) 14%,var(--panel));stroke:var(--line);stroke-width:1.4"/>
+      <rect x="278" y="40" width="92" height="44" rx="6" style="fill:color-mix(in srgb,var(--accent2) 22%,var(--panel));stroke:var(--accent2);stroke-width:2"/>
+      <rect x="372" y="40" width="104" height="44" rx="6" style="fill:color-mix(in srgb,var(--ink-soft) 14%,var(--panel));stroke:var(--line);stroke-width:1.4"/>
+      <rect x="478" y="40" width="92" height="44" rx="6" style="fill:color-mix(in srgb,var(--ink-soft) 14%,var(--panel));stroke:var(--line);stroke-width:1.4"/>
+      <rect x="572" y="40" width="60" height="44" rx="6" style="fill:color-mix(in srgb,var(--ink-soft) 14%,var(--panel));stroke:var(--line);stroke-width:1.4"/>
+      <rect x="634" y="40" width="68" height="44" rx="6" style="fill:color-mix(in srgb,var(--ink-soft) 14%,var(--panel));stroke:var(--line);stroke-width:1.4"/>
+    </g>
+    <text x="65" y="66" text-anchor="middle" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:11px">_time</text>
+    <text x="154" y="66" text-anchor="middle" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:11px">svc</text>
+    <text x="236" y="66" text-anchor="middle" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:11px">pod</text>
+    <text x="324" y="66" text-anchor="middle" style="fill:var(--accent2);font-family:var(--font-mono);font-size:12px;font-weight:700">level</text>
+    <text x="424" y="66" text-anchor="middle" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:11px">trace_id</text>
+    <text x="524" y="66" text-anchor="middle" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:11px">_msg</text>
+    <text x="602" y="66" text-anchor="middle" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:10px">req.path</text>
+    <text x="668" y="66" text-anchor="middle" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:10px">req.ms</text>
+    <text x="324" y="32" text-anchor="middle" style="fill:var(--accent2);font-family:var(--font-hand);font-size:13px">the only field the query wants</text>
+    <text x="360" y="118" text-anchor="middle" style="fill:var(--ink);font-family:var(--font-hand);font-size:14px">one opaque JSON blob — fields have no offsets</text>
+    <text x="360" y="150" text-anchor="middle" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:12px">to read `level`, parse everything before it (and after, to find the end)</text>
+    <text x="360" y="178" text-anchor="middle" style="fill:var(--rollback);font-family:var(--font-hand);font-size:13px">row-oriented ⇒ pay for every field to read one</text>
+  </svg>
+</Figure>
+
+You pay for every field on every line, even the ones the query never mentions.
+
+
+
+//Todo-claude= put the illustrations to explain the following limitations
+<Figure caption="The six structural limitations of naive-log, each one a wall the rest of the series climbs. Every later move VictoriaLogs makes — sorting, per-stream grouping, columnar blocks, bloom filters, immutable parts, dictionary encoding — exists to knock out one of these panels.">
+  <svg viewBox="0 0 720 244" role="img" aria-label="Six limitations of naive-log" style="width:100%;height:auto">
+    <defs><filter id="rl5" x="-3%" y="-6%" width="106%" height="112%"><feTurbulence type="fractalNoise" baseFrequency="0.012" numOctaves="2" seed="9" result="n"/><feDisplacementMap in="SourceGraphic" in2="n" scale="1.5"/></filter></defs>
+    <g filter="url(#rl5)">
+      <rect x="20" y="16" width="220" height="100" rx="10" style="fill:var(--panel);stroke:var(--line);stroke-width:1.5"/>
+      <rect x="260" y="16" width="220" height="100" rx="10" style="fill:var(--panel);stroke:var(--line);stroke-width:1.5"/>
+      <rect x="500" y="16" width="220" height="100" rx="10" style="fill:var(--panel);stroke:var(--line);stroke-width:1.5"/>
+      <rect x="20" y="128" width="220" height="100" rx="10" style="fill:var(--panel);stroke:var(--line);stroke-width:1.5"/>
+      <rect x="260" y="128" width="220" height="100" rx="10" style="fill:var(--panel);stroke:var(--line);stroke-width:1.5"/>
+      <rect x="500" y="128" width="220" height="100" rx="10" style="fill:var(--panel);stroke:var(--line);stroke-width:1.5"/>
+      <circle cx="46" cy="42" r="13" style="fill:var(--accent);stroke:none"/>
+      <circle cx="286" cy="42" r="13" style="fill:var(--accent);stroke:none"/>
+      <circle cx="526" cy="42" r="13" style="fill:var(--accent);stroke:none"/>
+      <circle cx="46" cy="154" r="13" style="fill:var(--rollback);stroke:none"/>
+      <circle cx="286" cy="154" r="13" style="fill:var(--accent);stroke:none"/>
+      <circle cx="526" cy="154" r="13" style="fill:var(--accent);stroke:none"/>
+    </g>
+    <text x="46" y="47" text-anchor="middle" style="fill:var(--panel);font-family:var(--font-hand);font-size:14px;font-weight:700">1</text>
+    <text x="286" y="47" text-anchor="middle" style="fill:var(--panel);font-family:var(--font-hand);font-size:14px;font-weight:700">2</text>
+    <text x="526" y="47" text-anchor="middle" style="fill:var(--panel);font-family:var(--font-hand);font-size:14px;font-weight:700">3</text>
+    <text x="46" y="159" text-anchor="middle" style="fill:var(--panel);font-family:var(--font-hand);font-size:14px;font-weight:700">4</text>
+    <text x="286" y="159" text-anchor="middle" style="fill:var(--panel);font-family:var(--font-hand);font-size:14px;font-weight:700">5</text>
+    <text x="526" y="159" text-anchor="middle" style="fill:var(--panel);font-family:var(--font-hand);font-size:14px;font-weight:700">6</text>
+    <text x="70" y="47" style="fill:var(--ink);font-family:var(--font-hand);font-size:15px;font-weight:700">No ordering</text>
+    <text x="38" y="78" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:11px">matches anywhere;</text>
+    <text x="38" y="96" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:11px">no binary search</text>
+    <text x="310" y="47" style="fill:var(--ink);font-family:var(--font-hand);font-size:15px;font-weight:700">No grouping</text>
+    <text x="278" y="78" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:11px">no per-stream</text>
+    <text x="278" y="96" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:11px">buckets</text>
+    <text x="550" y="47" style="fill:var(--ink);font-family:var(--font-hand);font-size:15px;font-weight:700">Row-oriented</text>
+    <text x="518" y="78" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:11px">parse all fields</text>
+    <text x="518" y="96" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:11px">to read one</text>
+    <text x="70" y="159" style="fill:var(--ink);font-family:var(--font-hand);font-size:15px;font-weight:700">No value index</text>
+    <text x="38" y="190" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:11px">token search scans</text>
+    <text x="38" y="208" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:11px">all values</text>
+    <text x="310" y="159" style="fill:var(--ink);font-family:var(--font-hand);font-size:15px;font-weight:700">Unbounded growth</text>
+    <text x="278" y="190" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:11px">delete = full</text>
+    <text x="278" y="208" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:11px">rewrite; no holes</text>
+    <text x="550" y="159" style="fill:var(--ink);font-family:var(--font-hand);font-size:15px;font-weight:700">No compression</text>
+    <text x="518" y="190" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:11px">gzip kills</text>
+    <text x="518" y="208" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:11px">random access</text>
+  </svg>
+</Figure>
+
+### Limitation of naive-log 
+
+Lets address the limitations of naive-log 
+
+#### 1. No ordering 
+when queried for some logs the matches could be anywhere in the file, no sorting no ordering, so not even binary search could be done.
+
+#### 2. No grouping 
+every line tested individually, no "these belong to streamx" kind of grouping 
+
+#### 3. Row oriented 
+must parse all fields of every line to read one 
+
+#### 4. No value index within a field
+even per column, token/substring search reads all the values 
+
+### 5. Unbounded Growth
+Append only means deleting old data = rewriting the whole fil( you can't punch a hole in the middle). Retention by age is impossible without a full rewrite.
+
+#### 6. No compression 
+Logs are wildly repetitive, but opaque JSONL only compresses generically and gzipping the file destroys random access to read line N you decompress from the start).
+
+### What are we going to do in this blog entry 
+we are not going to see how VictoriaLogs addresses the problems of naive-log. The first step would be 
+what the log row is and where does it belong.
+
+we can't start building optimizations like index and others over simple append only log.
+So the first real move isn't an index, its imposing structure at the front door.
+
+At ingest time VictoriaLogs parses the log into typed fields, separates the fields that identify the source ( the stream fields), computes a streamID from them,
+and buffers the row in the column friendly shape.
+
+This is the honest framing of this post: before you can be fast, you have to decide what you're storing. The naive store answers this question as "a line of text"; VictoriaLogs answers "a typed row that already knows its stream."
+Every later rung — sorting, columns, bloom, the inverted index — is only possible because that decision was made at the door.
+
+### Properties of a log workload 
+it would be beneficial to discuss the properties of the log workload at this point.
+
+because every good log storage engine would exploit these properties 
+
+#### 1. Write pattern
+the first property is this that logs are by nature appendonly, they are not updated in place, just write-once and then query.
+
+#### 2. Volume 
+They have an enormous volume (GB/TB per day), each row is individually cheap/low value.
+
+#### 3. Time 
+Logs roughly arrive in the time order, but you can never assume exactly.
+when a log line shows up at the ingestion endpoint, its _time is usually close to "now" and usually later than the line before it.
+But "usually" is not "always," and the gap between those two words is what forces a real design decision.
+
+#### 4. Repetition 
+The log data is massively repetitive - level , service , host , k8s  labels repeat
+
+#### 5. Query-shape 
+The most frequent queries include 
+time range , a few field filters  and free text search 
+
+#### 6 Retention 
+We don't need to retain the logs data for long periods of times as we do in other main stream databases.
+
+### The steelman — the obvious fixes, and why each fails
+A sharp reader will shout four fixes at the screen. Answer them, and each answer is the motivation for a specific VL design choice.
+
+#### 1. Just add an index on every field
+This is roughly what Elasticsearch does — and why it needs ~30× the RAM and ~15× the disk of VictoriaLogs. It ignores workload: logs are too high-volume and too cheap-per-row to afford a precise index on everything. 
+
+#### 2. Just keep the file sorted by time 
+you destroy the O(1) append that made the naive store attractive in the first place
+And one sort order still can't serve stream + field queries. VL's answer (the LSM move): never re-sort a giant file — write many small, immutable, already-sorted parts, and merge them in the background.
+
+#### 3. Just use one file per day
+Half-right — that's partitioning, and VL does exactly this for retention. But it only bounds coarse time and deletion; within a day you still full-scan. Necessary, not sufficient. 
+
+#### 4. Just gzip the file.
+Kills random access — to read line N you decompress from byte 0. Compression has to be per block so you decompress only what you read. 
+
+### VictoriaLogs ingestion 
+The entire ingest layer exists to melt ~10 different wire formats down into one neutral shape — (timestamp, []Field) — and hand it across a two-method interface. Everything protocol-specific dies at that boundary.
+
+That's why VL can speak Loki, Elasticsearch, OTel, syslog, journald, Datadog, Splunk, jsonline, and its native protocol without the storage engine ever growing a protocol-specific branch.
+
+#### The funnel - one binary, N doors, one convergence point 
+The router (app/vlinsert/main.go:42) dispatches each URL path to a protocol handler. Every handler does the same job and converges on one call:
+//Todo-claude= make an illustration to explain the above point 
+
+<Figure caption="The funnel. Around ten wire protocols enter through their own URL paths, but every handler does the same job: boil its format down to one neutral shape — (timestamp, []Field) — and hand it to a single call, lmp.AddRow. Past that convergence point nothing downstream knows which protocol a row came from.">
+  <svg viewBox="0 0 720 320" role="img" aria-label="Ingestion funnel: many protocols to one call" style="width:100%;height:auto">
+    <defs><filter id="rl6" x="-3%" y="-6%" width="106%" height="112%"><feTurbulence type="fractalNoise" baseFrequency="0.012" numOctaves="2" seed="4" result="n"/><feDisplacementMap in="SourceGraphic" in2="n" scale="1.6"/></filter><marker id="ah6" markerWidth="9" markerHeight="9" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" style="fill:var(--ink-soft)"/></marker></defs>
+    <g filter="url(#rl6)">
+      <rect x="16" y="16" width="130" height="26" rx="7" style="fill:var(--panel);stroke:var(--accent);stroke-width:1.5"/>
+      <rect x="16" y="52" width="130" height="26" rx="7" style="fill:var(--panel);stroke:var(--accent);stroke-width:1.5"/>
+      <rect x="16" y="88" width="130" height="26" rx="7" style="fill:var(--panel);stroke:var(--accent);stroke-width:1.5"/>
+      <rect x="16" y="124" width="130" height="26" rx="7" style="fill:var(--panel);stroke:var(--accent);stroke-width:1.5"/>
+      <rect x="16" y="160" width="130" height="26" rx="7" style="fill:var(--panel);stroke:var(--accent);stroke-width:1.5"/>
+      <rect x="16" y="196" width="130" height="26" rx="7" style="fill:var(--panel);stroke:var(--accent);stroke-width:1.5"/>
+      <rect x="16" y="232" width="130" height="26" rx="7" style="fill:var(--panel);stroke:var(--accent);stroke-width:1.5"/>
+      <rect x="16" y="268" width="130" height="26" rx="7" style="fill:var(--panel);stroke:var(--accent);stroke-width:1.5"/>
+      <line x1="146" y1="29" x2="372" y2="162" style="stroke:var(--ink-soft);stroke-width:1.3;fill:none"/>
+      <line x1="146" y1="65" x2="372" y2="164" style="stroke:var(--ink-soft);stroke-width:1.3;fill:none"/>
+      <line x1="146" y1="101" x2="372" y2="166" style="stroke:var(--ink-soft);stroke-width:1.3;fill:none"/>
+      <line x1="146" y1="137" x2="372" y2="167" style="stroke:var(--ink-soft);stroke-width:1.3;fill:none"/>
+      <line x1="146" y1="173" x2="372" y2="169" style="stroke:var(--ink-soft);stroke-width:1.3;fill:none"/>
+      <line x1="146" y1="209" x2="372" y2="171" style="stroke:var(--ink-soft);stroke-width:1.3;fill:none"/>
+      <line x1="146" y1="245" x2="372" y2="173" style="stroke:var(--ink-soft);stroke-width:1.3;fill:none"/>
+      <line x1="146" y1="281" x2="372" y2="175" style="stroke:var(--ink-soft);stroke-width:1.3;fill:none" marker-end="url(#ah6)"/>
+      <rect x="374" y="138" width="178" height="58" rx="10" style="fill:color-mix(in srgb,var(--accent2) 12%,var(--panel));stroke:var(--accent2);stroke-width:1.9"/>
+      <line x1="552" y1="167" x2="594" y2="167" style="stroke:var(--ink-soft);stroke-width:1.8;fill:none" marker-end="url(#ah6)"/>
+      <rect x="596" y="138" width="112" height="58" rx="10" style="fill:var(--panel);stroke:var(--accent);stroke-width:1.9"/>
+    </g>
+    <text x="81" y="33" text-anchor="middle" style="fill:var(--ink);font-family:var(--font-mono);font-size:11px">jsonline</text>
+    <text x="81" y="69" text-anchor="middle" style="fill:var(--ink);font-family:var(--font-mono);font-size:11px">Elasticsearch</text>
+    <text x="81" y="105" text-anchor="middle" style="fill:var(--ink);font-family:var(--font-mono);font-size:11px">Loki</text>
+    <text x="81" y="141" text-anchor="middle" style="fill:var(--ink);font-family:var(--font-mono);font-size:11px">OpenTelemetry</text>
+    <text x="81" y="177" text-anchor="middle" style="fill:var(--ink);font-family:var(--font-mono);font-size:11px">Datadog</text>
+    <text x="81" y="213" text-anchor="middle" style="fill:var(--ink);font-family:var(--font-mono);font-size:11px">Splunk</text>
+    <text x="81" y="249" text-anchor="middle" style="fill:var(--ink);font-family:var(--font-mono);font-size:11px">journald</text>
+    <text x="81" y="285" text-anchor="middle" style="fill:var(--ink);font-family:var(--font-mono);font-size:11px">native</text>
+    <text x="81" y="309" text-anchor="middle" style="fill:var(--ink-soft);font-family:var(--font-hand);font-size:12px">~10 wire formats</text>
+    <text x="463" y="162" text-anchor="middle" style="fill:var(--ink);font-family:var(--font-mono);font-size:13px">(timestamp, []Field)</text>
+    <text x="463" y="182" text-anchor="middle" style="fill:var(--accent2);font-family:var(--font-hand);font-size:12px">one neutral shape</text>
+    <text x="652" y="163" text-anchor="middle" style="fill:var(--ink);font-family:var(--font-mono);font-size:12px">lmp.</text>
+    <text x="652" y="180" text-anchor="middle" style="fill:var(--ink);font-family:var(--font-mono);font-size:12px">AddRow</text>
+  </svg>
+</Figure>
+
+The neutral shape is deliberately dumb — rows.go:18:
+
+```go 
+type Field struct {
+	Name  string
+	Value string
+}
+
+```
+
+Both fields are strings. At ingest, everything is stringly-typed — even req.ms=12 arrives as the string "12". 
+
+#### Jsonline, traced end to end (the representative handler)
+
+//Todo-claude= put the illustration here 
+
+<Figure caption="The life of one jsonline request. Read the knobs once (GetCommonParams), open one processor wrapping one buffer, then loop: each line is parsed and handed to AddRow. At the end MustClose flushes whatever is left. The per-line work (readLine → AddRow) is the only part that repeats.">
+  <svg viewBox="0 0 720 210" role="img" aria-label="jsonline request lifecycle" style="width:100%;height:auto">
+    <defs><filter id="rl7" x="-3%" y="-10%" width="106%" height="120%"><feTurbulence type="fractalNoise" baseFrequency="0.013" numOctaves="2" seed="6" result="n"/><feDisplacementMap in="SourceGraphic" in2="n" scale="1.6"/></filter><marker id="ah7" markerWidth="9" markerHeight="9" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" style="fill:var(--ink-soft)"/></marker></defs>
+    <g filter="url(#rl7)">
+      <rect x="16" y="78" width="104" height="48" rx="9" style="fill:var(--panel);stroke:var(--line);stroke-width:1.6"/>
+      <rect x="150" y="78" width="118" height="48" rx="9" style="fill:var(--panel);stroke:var(--accent);stroke-width:1.7"/>
+      <rect x="298" y="78" width="136" height="48" rx="9" style="fill:var(--panel);stroke:var(--accent);stroke-width:1.7"/>
+      <rect x="462" y="40" width="150" height="124" rx="12" style="fill:color-mix(in srgb,var(--accent2) 9%,var(--panel));stroke:var(--accent2);stroke-width:1.9" stroke-dasharray="6 4"/>
+      <rect x="478" y="60" width="118" height="40" rx="8" style="fill:var(--panel);stroke:var(--line);stroke-width:1.5"/>
+      <rect x="478" y="110" width="118" height="40" rx="8" style="fill:var(--panel);stroke:var(--line);stroke-width:1.5"/>
+      <rect x="640" y="78" width="66" height="48" rx="9" style="fill:var(--panel);stroke:var(--rollback);stroke-width:1.7"/>
+      <line x1="120" y1="102" x2="146" y2="102" style="stroke:var(--ink-soft);stroke-width:1.6;fill:none" marker-end="url(#ah7)"/>
+      <line x1="268" y1="102" x2="294" y2="102" style="stroke:var(--ink-soft);stroke-width:1.6;fill:none" marker-end="url(#ah7)"/>
+      <line x1="434" y1="102" x2="458" y2="102" style="stroke:var(--ink-soft);stroke-width:1.6;fill:none" marker-end="url(#ah7)"/>
+      <line x1="537" y1="100" x2="537" y2="110" style="stroke:var(--ink-soft);stroke-width:1.5;fill:none" marker-end="url(#ah7)"/>
+      <line x1="612" y1="102" x2="636" y2="102" style="stroke:var(--ink-soft);stroke-width:1.6;fill:none" marker-end="url(#ah7)"/>
+    </g>
+    <text x="68" y="99" text-anchor="middle" style="fill:var(--ink);font-family:var(--font-mono);font-size:11px">POST</text>
+    <text x="68" y="114" text-anchor="middle" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:11px">body</text>
+    <text x="209" y="99" text-anchor="middle" style="fill:var(--ink);font-family:var(--font-mono);font-size:10px">GetCommon</text>
+    <text x="209" y="114" text-anchor="middle" style="fill:var(--ink);font-family:var(--font-mono);font-size:10px">Params</text>
+    <text x="366" y="99" text-anchor="middle" style="fill:var(--ink);font-family:var(--font-mono);font-size:10px">NewLogMessage</text>
+    <text x="366" y="114" text-anchor="middle" style="fill:var(--ink);font-family:var(--font-mono);font-size:10px">Processor</text>
+    <text x="537" y="34" text-anchor="middle" style="fill:var(--accent2);font-family:var(--font-hand);font-size:12px">per line (loop)</text>
+    <text x="537" y="85" text-anchor="middle" style="fill:var(--ink);font-family:var(--font-mono);font-size:11px">readLine</text>
+    <text x="537" y="135" text-anchor="middle" style="fill:var(--ink);font-family:var(--font-mono);font-size:11px">AddRow</text>
+    <text x="673" y="99" text-anchor="middle" style="fill:var(--ink);font-family:var(--font-mono);font-size:10px">Must</text>
+    <text x="673" y="114" text-anchor="middle" style="fill:var(--ink);font-family:var(--font-mono);font-size:10px">Close</text>
+  </svg>
+</Figure>
+
+The heart is readLine (jsonline.go:98):
+
+```go 
+p := logstorage.GetJSONParser()
+defer logstorage.PutJSONParser(p)
+
+if err := p.ParseLogMessage(line, preserveKeys, ""); err != nil {   // ① parse + flatten
+	return true, fmt.Errorf("%w; line contents: %q", err, line)
+}
+ts, err := insertutil.ExtractTimestampFromFields(timeFields, p.Fields) // ② pull out the timestamp
+if err != nil {
+	return true, fmt.Errorf("%w; line contents: %q", err, line)
+}
+logstorage.RenameField(p.Fields, msgFields, "_msg")                    // ③ normalize the message field
+lmp.AddRow(ts, p.Fields, -1)         
+```
+
+Note the loop's error policy in processStreamInternal: a bad line is logged and skipped; the request only fails if every line failed (jsonline.go:88). One malformed log doesn't poison a batch.
+
+
+### The three transformations — where the data model gets manufactured
+The wire has no concept of _time or _msg. The ingest layer invents them, per config, from arbitrary input. This is the conceptual core of Module 2:
+
+//Todo-claude= put the illustration for the code trace for the three transformations here 
+
+<Figure caption="The three transformations that manufacture the data model at the door. Nested keys are flattened to dotted names; the chosen time field is pulled out of the fields and into a real timestamp; the chosen message field is renamed to _msg. What enters as arbitrary JSON leaves as VictoriaLogs' flat, special-field data model.">
+  <svg viewBox="0 0 720 232" role="img" aria-label="The three ingest transformations" style="width:100%;height:auto">
+    <defs><filter id="rl8" x="-3%" y="-6%" width="106%" height="112%"><feTurbulence type="fractalNoise" baseFrequency="0.013" numOctaves="2" seed="8" result="n"/><feDisplacementMap in="SourceGraphic" in2="n" scale="1.5"/></filter><marker id="ah8" markerWidth="9" markerHeight="9" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" style="fill:var(--accent2)"/></marker></defs>
+    <g filter="url(#rl8)">
+      <circle cx="34" cy="48" r="13" style="fill:var(--accent);stroke:none"/>
+      <circle cx="34" cy="116" r="13" style="fill:var(--accent);stroke:none"/>
+      <circle cx="34" cy="184" r="13" style="fill:var(--accent);stroke:none"/>
+      <rect x="250" y="28" width="156" height="40" rx="7" style="fill:var(--panel);stroke:var(--line);stroke-width:1.4"/>
+      <rect x="250" y="96" width="156" height="40" rx="7" style="fill:var(--panel);stroke:var(--line);stroke-width:1.4"/>
+      <rect x="250" y="164" width="156" height="40" rx="7" style="fill:var(--panel);stroke:var(--line);stroke-width:1.4"/>
+      <rect x="470" y="28" width="236" height="40" rx="7" style="fill:color-mix(in srgb,var(--accent2) 16%,var(--panel));stroke:var(--accent2);stroke-width:1.7"/>
+      <rect x="470" y="96" width="236" height="40" rx="7" style="fill:color-mix(in srgb,var(--accent2) 16%,var(--panel));stroke:var(--accent2);stroke-width:1.7"/>
+      <rect x="470" y="164" width="236" height="40" rx="7" style="fill:color-mix(in srgb,var(--accent2) 16%,var(--panel));stroke:var(--accent2);stroke-width:1.7"/>
+      <line x1="408" y1="48" x2="466" y2="48" style="stroke:var(--accent2);stroke-width:1.7;fill:none" marker-end="url(#ah8)"/>
+      <line x1="408" y1="116" x2="466" y2="116" style="stroke:var(--accent2);stroke-width:1.7;fill:none" marker-end="url(#ah8)"/>
+      <line x1="408" y1="184" x2="466" y2="184" style="stroke:var(--accent2);stroke-width:1.7;fill:none" marker-end="url(#ah8)"/>
+    </g>
+    <text x="34" y="53" text-anchor="middle" style="fill:var(--panel);font-family:var(--font-hand);font-size:14px;font-weight:700">1</text>
+    <text x="34" y="121" text-anchor="middle" style="fill:var(--panel);font-family:var(--font-hand);font-size:14px;font-weight:700">2</text>
+    <text x="34" y="189" text-anchor="middle" style="fill:var(--panel);font-family:var(--font-hand);font-size:14px;font-weight:700">3</text>
+    <text x="58" y="44" style="fill:var(--ink);font-family:var(--font-hand);font-size:14px;font-weight:700">parse + flatten</text>
+    <text x="58" y="60" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:10px">nested to dotted</text>
+    <text x="58" y="112" style="fill:var(--ink);font-family:var(--font-hand);font-size:14px;font-weight:700">extract timestamp</text>
+    <text x="58" y="128" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:10px">pull it out of fields</text>
+    <text x="58" y="180" style="fill:var(--ink);font-family:var(--font-hand);font-size:14px;font-weight:700">rename message</text>
+    <text x="58" y="196" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:10px">to _msg</text>
+    <text x="328" y="52" text-anchor="middle" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:11px">req ▸ ms = 12</text>
+    <text x="328" y="120" text-anchor="middle" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:11px">ts = 09:00:01</text>
+    <text x="328" y="188" text-anchor="middle" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:11px">message = boom</text>
+    <text x="588" y="52" text-anchor="middle" style="fill:var(--ink);font-family:var(--font-mono);font-size:11px">req.ms = "12"</text>
+    <text x="588" y="120" text-anchor="middle" style="fill:var(--ink);font-family:var(--font-mono);font-size:11px">_time  ·  ts removed</text>
+    <text x="588" y="188" text-anchor="middle" style="fill:var(--ink);font-family:var(--font-mono);font-size:11px">_msg = boom</text>
+  </svg>
+</Figure>
+
+Flattening matters: `{"req":{"path":"/x"}}` becomes a field literally named req.path. That's why VL's data model is flat even though JSON is nested — the flattening happens right here at the door.
+
+### CommonParams — the dial-board behind the transformations
+
+Those three transformations, and the streamID step coming up, all need to know one thing the handler can't guess: *which* incoming field is the timestamp, *which* is the message, *which* fields are the identity. Is the time in `ts`, `timestamp`, `@timestamp`? The generic handler has no idea. So every request **declares** the mapping, and `GetCommonParams` (`common_params.go:44`) distils that declaration into a single struct the rest of the pipeline reads.
+
+Every knob is read from **either** a query arg **or** a `VL-*` header — `getArray` checks both — so a `curl` user and a header-only log shipper drive the same code path.
+
+<Figure caption="CommonParams is the one place the request's intent is distilled. Each knob can be set by a URL arg or an equivalent header, and each one feeds a specific downstream step. The generic handler holds no knowledge like 'ts means time' — it all arrives here, per request.">
+  <svg viewBox="0 0 720 236" role="img" aria-label="CommonParams control surface" style="width:100%;height:auto">
+    <defs><filter id="rl9" x="-3%" y="-6%" width="106%" height="112%"><feTurbulence type="fractalNoise" baseFrequency="0.012" numOctaves="2" seed="2" result="n"/><feDisplacementMap in="SourceGraphic" in2="n" scale="1.5"/></filter><marker id="ah9" markerWidth="9" markerHeight="9" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" style="fill:var(--ink-soft)"/></marker></defs>
+    <g filter="url(#rl9)">
+      <rect x="14" y="58" width="190" height="34" rx="7" style="fill:var(--panel);stroke:var(--accent);stroke-width:1.5"/>
+      <rect x="14" y="140" width="190" height="34" rx="7" style="fill:var(--panel);stroke:var(--accent);stroke-width:1.5"/>
+      <rect x="272" y="80" width="150" height="72" rx="10" style="fill:color-mix(in srgb,var(--accent) 10%,var(--panel));stroke:var(--accent);stroke-width:1.9"/>
+      <line x1="204" y1="75" x2="270" y2="104" style="stroke:var(--ink-soft);stroke-width:1.5;fill:none"/>
+      <line x1="204" y1="157" x2="270" y2="128" style="stroke:var(--ink-soft);stroke-width:1.5;fill:none" marker-end="url(#ah9)"/>
+      <rect x="498" y="22" width="210" height="40" rx="8" style="fill:var(--panel);stroke:var(--accent2);stroke-width:1.5"/>
+      <rect x="498" y="96" width="210" height="40" rx="8" style="fill:var(--panel);stroke:var(--accent2);stroke-width:1.5"/>
+      <rect x="498" y="170" width="210" height="40" rx="8" style="fill:var(--panel);stroke:var(--accent2);stroke-width:1.5"/>
+      <line x1="422" y1="104" x2="494" y2="44" style="stroke:var(--accent2);stroke-width:1.5;fill:none" marker-end="url(#ah9)"/>
+      <line x1="422" y1="116" x2="494" y2="116" style="stroke:var(--accent2);stroke-width:1.5;fill:none" marker-end="url(#ah9)"/>
+      <line x1="422" y1="128" x2="494" y2="188" style="stroke:var(--accent2);stroke-width:1.5;fill:none" marker-end="url(#ah9)"/>
+    </g>
+    <text x="109" y="79" text-anchor="middle" style="fill:var(--ink);font-family:var(--font-mono);font-size:11px">?_stream_fields=…</text>
+    <text x="109" y="161" text-anchor="middle" style="fill:var(--ink);font-family:var(--font-mono);font-size:11px">VL-Stream-Fields:…</text>
+    <text x="109" y="118" text-anchor="middle" style="fill:var(--ink-soft);font-family:var(--font-hand);font-size:13px">arg OR header</text>
+    <text x="347" y="112" text-anchor="middle" style="fill:var(--ink);font-family:var(--font-hand);font-size:14px;font-weight:700">CommonParams</text>
+    <text x="347" y="132" text-anchor="middle" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:10px">the knobs</text>
+    <text x="603" y="46" text-anchor="middle" style="fill:var(--ink);font-family:var(--font-mono);font-size:11px">TimeFields → _time</text>
+    <text x="603" y="120" text-anchor="middle" style="fill:var(--ink);font-family:var(--font-mono);font-size:11px">MsgFields → _msg</text>
+    <text x="603" y="194" text-anchor="middle" style="fill:var(--ink);font-family:var(--font-mono);font-size:11px">StreamFields → streamID</text>
+  </svg>
+</Figure>
+
+The knobs that matter for this post:
+
+<Table
+  headers={['Knob', 'arg / header', 'Feeds']}
+  rows={[
+    ['<code>TimeFields</code>', '<code>_time_field</code> / <code>VL-Time-Field</code>', 'transformation ② — extract <code>_time</code>'],
+    ['<code>MsgFields</code>', '<code>_msg_field</code> / <code>VL-Msg-Field</code>', 'transformation ③ — rename <code>_msg</code>'],
+    ['<code>StreamFields</code>', '<code>_stream_fields</code> / <code>VL-Stream-Fields</code>', 'the <b>streamID</b> (next section)'],
+    ['<code>IgnoreFields</code>, <code>ExtraFields</code>, <code>Debug</code>, …', 'various', 'drop fields · stamp constant fields · dry-run'],
+  ]}
+/>
+
+<MarginNote>
+  <b>Two subtleties.</b> <code>TimeFields</code> defaults to <code>["_time"]</code>, so it's never empty — the separate <code>IsTimeFieldSet</code> flag is what tells downstream code whether the client actually <em>chose</em> a time field. And <code>StreamFields</code> is validated <em>eagerly</em>: a malformed identity spec rejects the whole request at the door, before a single row is shaped.
+</MarginNote>
+
+### The seam — one interface, injected once
+
+The ingest layer never imports the storage code. The moment a batch is ready, it pushes it through a two-method interface (`common_params.go:173`):
+
+```go
+type LogRowsStorage interface {
+	MustAddRows(lr *logstorage.LogRows)   // store this batch
+	CanWriteData() error                   // can you accept writes right now?
+}
+```
+
+Think of it as a wall socket. Ingest holds a plug that fits the socket and nothing more — it has no idea what's behind the wall. Exactly one line, at startup, decides what's plugged in (`app/victoria-logs/main.go:50`):
+
+```go
+insertutil.SetLogRowsStorage(&vlstorage.Storage{})   // single-node: the local-disk storage
+```
+
+<Figure caption="The seam. Ingest talks only to a two-method socket. One line at boot decides what's plugged in: the local-disk storage for single-node, or a network forwarder for cluster. Every ingest file upstream is identical in both — the entire single-node-vs-cluster fork collapses to this one injection.">
+  <svg viewBox="0 0 720 210" role="img" aria-label="The storage seam" style="width:100%;height:auto">
+    <defs><filter id="rl10" x="-3%" y="-8%" width="106%" height="116%"><feTurbulence type="fractalNoise" baseFrequency="0.012" numOctaves="2" seed="5" result="n"/><feDisplacementMap in="SourceGraphic" in2="n" scale="1.6"/></filter><marker id="ah10" markerWidth="9" markerHeight="9" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" style="fill:var(--ink-soft)"/></marker></defs>
+    <g filter="url(#rl10)">
+      <rect x="16" y="66" width="190" height="78" rx="11" style="fill:var(--panel);stroke:var(--accent);stroke-width:1.8"/>
+      <rect x="300" y="60" width="120" height="90" rx="10" style="fill:color-mix(in srgb,var(--accent2) 10%,var(--panel));stroke:var(--accent2);stroke-width:1.9"/>
+      <line x1="206" y1="105" x2="296" y2="105" style="stroke:var(--ink-soft);stroke-width:1.8;fill:none" marker-end="url(#ah10)"/>
+      <rect x="506" y="40" width="198" height="42" rx="8" style="fill:var(--panel);stroke:var(--line);stroke-width:1.6"/>
+      <rect x="506" y="124" width="198" height="42" rx="8" style="fill:var(--panel);stroke:var(--line);stroke-width:1.6"/>
+      <line x1="420" y1="90" x2="502" y2="61" style="stroke:var(--ink-soft);stroke-width:1.5;fill:none" marker-end="url(#ah10)"/>
+      <line x1="420" y1="120" x2="502" y2="145" style="stroke:var(--ink-soft);stroke-width:1.5;fill:none" marker-end="url(#ah10)"/>
+    </g>
+    <text x="111" y="98" text-anchor="middle" style="fill:var(--ink);font-family:var(--font-hand);font-size:14px;font-weight:700">ingest side</text>
+    <text x="111" y="118" text-anchor="middle" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:10px">generic · one plug</text>
+    <text x="360" y="100" text-anchor="middle" style="fill:var(--ink);font-family:var(--font-mono);font-size:11px">Must</text>
+    <text x="360" y="116" text-anchor="middle" style="fill:var(--ink);font-family:var(--font-mono);font-size:11px">AddRows</text>
+    <text x="360" y="166" text-anchor="middle" style="fill:var(--accent2);font-family:var(--font-hand);font-size:12px">the socket</text>
+    <text x="605" y="66" text-anchor="middle" style="fill:var(--ink);font-family:var(--font-mono);font-size:11px">single-node → local disk</text>
+    <text x="605" y="150" text-anchor="middle" style="fill:var(--ink);font-family:var(--font-mono);font-size:11px">cluster → network nodes</text>
+    <text x="605" y="104" text-anchor="middle" style="fill:var(--ink-soft);font-family:var(--font-hand);font-size:12px">plugged in once, at boot</text>
+  </svg>
+</Figure>
+
+That one injection is the whole of the single-node-versus-cluster decision. Every file we've read, and every file left in this post, only ever presses that socket — none of them branch on "am I a cluster?"
+
+### Buffering — one processor, one cart, three triggers
+
+`AddRow` does **not** store a row. A single request can carry thousands of lines, and writing each one to storage individually would recreate the naive store's tiny-write problem. So for each request the handler opens **one processor** owning **one reusable buffer** — call it the cart — and every line is dropped into that same cart until something decides to wheel it away.
+
+The cart isn't freshly allocated; it's borrowed from a pool (`GetLogRows`), already labelled with this request's `CommonParams` so it knows how to shape each line without being re-told. At terabytes a day, make-and-discard would bury the garbage collector; reuse is the Post-0 "cheap per row" economics showing up in code.
+
+#### AddRow, per line (`common_params.go:253`)
+
+```go
+lmp.mu.Lock(); defer lmp.mu.Unlock()                     // claim the cart
+lmp.unflushedRows++; lmp.unflushedBytes += EstimatedJSONRowLen(fields)  // tally (for metrics)
+if len(fields) > *MaxFieldsPerLine { drop + warn; return }   // guard: default 1000
+lmp.lr.MustAdd(cp.TenantID, timestamp, fields, streamFieldsLen)   // into the cart → streamID + layout
+if lmp.cp.Debug { render; ResetKeepSettings; return }    // dry-run: show, don't keep
+if lmp.lr.NeedFlush() { lmp.flushLocked() }              // size trigger
+```
+
+The lock exists because a **background timer goroutine** can also reach for the same cart (next). The two counters are for **metrics** (`vl_rows_ingested_total` and friends) — the "is the cart full?" decision is a separate measurement the cart keeps on *itself* (`NeedFlush`: more than 1.75 MB of bytes, or more than ~20,971 rows).
+
+#### The three triggers
+
+<Figure caption="One cart, three ways to wheel it out: it fills past the size limit, a ~1s jittered timer fires, or the request closes. All three run flushLocked — push the whole batch through the socket, then empty the cart but keep its label, so the same cart is reused for the next lines.">
+  <svg viewBox="0 0 720 234" role="img" aria-label="The three flush triggers" style="width:100%;height:auto">
+    <defs><filter id="rl12" x="-3%" y="-6%" width="106%" height="112%"><feTurbulence type="fractalNoise" baseFrequency="0.012" numOctaves="2" seed="7" result="n"/><feDisplacementMap in="SourceGraphic" in2="n" scale="1.5"/></filter><marker id="ah12" markerWidth="9" markerHeight="9" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" style="fill:var(--ink-soft)"/></marker></defs>
+    <g filter="url(#rl12)">
+      <rect x="20" y="20" width="150" height="34" rx="8" style="fill:var(--panel);stroke:var(--accent);stroke-width:1.5"/>
+      <rect x="20" y="96" width="150" height="34" rx="8" style="fill:var(--panel);stroke:var(--accent);stroke-width:1.5"/>
+      <rect x="20" y="172" width="150" height="34" rx="8" style="fill:var(--panel);stroke:var(--accent);stroke-width:1.5"/>
+      <rect x="250" y="80" width="150" height="66" rx="11" style="fill:color-mix(in srgb,var(--accent) 10%,var(--panel));stroke:var(--accent);stroke-width:1.9"/>
+      <line x1="170" y1="37" x2="248" y2="100" style="stroke:var(--ink-soft);stroke-width:1.5;fill:none"/>
+      <line x1="170" y1="113" x2="248" y2="113" style="stroke:var(--ink-soft);stroke-width:1.5;fill:none" marker-end="url(#ah12)"/>
+      <line x1="170" y1="189" x2="248" y2="126" style="stroke:var(--ink-soft);stroke-width:1.5;fill:none"/>
+      <line x1="400" y1="113" x2="452" y2="113" style="stroke:var(--ink-soft);stroke-width:1.8;fill:none" marker-end="url(#ah12)"/>
+      <rect x="454" y="66" width="252" height="40" rx="8" style="fill:var(--panel);stroke:var(--accent2);stroke-width:1.7"/>
+      <rect x="454" y="120" width="252" height="40" rx="8" style="fill:var(--panel);stroke:var(--line);stroke-width:1.5"/>
+    </g>
+    <text x="95" y="41" text-anchor="middle" style="fill:var(--ink);font-family:var(--font-mono);font-size:11px">① SIZE  (full)</text>
+    <text x="95" y="117" text-anchor="middle" style="fill:var(--ink);font-family:var(--font-mono);font-size:11px">② TIME  (~1s)</text>
+    <text x="95" y="193" text-anchor="middle" style="fill:var(--ink);font-family:var(--font-mono);font-size:11px">③ CLOSE (ends)</text>
+    <text x="325" y="109" text-anchor="middle" style="fill:var(--ink);font-family:var(--font-hand);font-size:14px;font-weight:700">flushLocked</text>
+    <text x="325" y="128" text-anchor="middle" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:10px">the cart</text>
+    <text x="580" y="91" text-anchor="middle" style="fill:var(--ink);font-family:var(--font-mono);font-size:11px">MustAddRows → socket</text>
+    <text x="580" y="145" text-anchor="middle" style="fill:var(--ink);font-family:var(--font-mono);font-size:11px">ResetKeepSettings → reuse</text>
+  </svg>
+</Figure>
+
+`flushLocked` (`common_params.go:319`) is the drain: `MustAddRows(lr)` pushes the whole batch through the socket, then `ResetKeepSettings()` empties the cart but keeps its label — so it's the **same** cart start to finish, emptied and refilled, never swapped. `MustClose` does a final flush and returns the cart to the pool, so no line is ever stranded in a half-full cart.
+
+#### The visibility gap — two buffers in series
+
+Here's the landmine, and it's one the verification pass corrected. A flush does **not** make a row searchable. Crossing the socket only lands the batch in the *storage* layer's own buffer, which runs its **own** ~1-second timer before it builds the in-memory part that queries actually read.
+
+<Figure caption="Why a freshly POSTed row isn't searchable for a second or two. The ingest cart flushes to the storage layer the instant the request closes — but the storage layer buffers ~1s more (a time.AfterFunc timer in datadb) before building the in-memory part queries read. The delay lives past the socket, in the storage layer — a Post 3 mechanism, not the ingest buffer.">
+  <svg viewBox="0 0 720 210" role="img" aria-label="Two buffers in series, the visibility timeline" style="width:100%;height:auto">
+    <defs><filter id="rl13" x="-3%" y="-8%" width="106%" height="116%"><feTurbulence type="fractalNoise" baseFrequency="0.012" numOctaves="2" seed="3" result="n"/><feDisplacementMap in="SourceGraphic" in2="n" scale="1.5"/></filter><marker id="ah13" markerWidth="9" markerHeight="9" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" style="fill:var(--ink-soft)"/></marker></defs>
+    <g filter="url(#rl13)">
+      <rect x="16" y="60" width="150" height="50" rx="9" style="fill:var(--panel);stroke:var(--accent);stroke-width:1.7"/>
+      <rect x="208" y="60" width="160" height="50" rx="9" style="fill:var(--panel);stroke:var(--accent2);stroke-width:1.7"/>
+      <rect x="410" y="60" width="150" height="50" rx="9" style="fill:color-mix(in srgb,var(--accent2) 16%,var(--panel));stroke:var(--accent2);stroke-width:1.9"/>
+      <rect x="602" y="60" width="104" height="50" rx="9" style="fill:var(--panel);stroke:var(--line);stroke-width:1.6"/>
+      <line x1="166" y1="85" x2="204" y2="85" style="stroke:var(--ink-soft);stroke-width:1.7;fill:none" marker-end="url(#ah13)"/>
+      <line x1="368" y1="85" x2="406" y2="85" style="stroke:var(--ink-soft);stroke-width:1.7;fill:none" marker-end="url(#ah13)"/>
+      <line x1="560" y1="85" x2="598" y2="85" style="stroke:var(--ink-soft);stroke-width:1.7;fill:none" marker-end="url(#ah13)"/>
+      <line x1="188" y1="130" x2="188" y2="150" style="stroke:var(--line);stroke-width:1.4" stroke-dasharray="4 3"/>
+      <line x1="485" y1="130" x2="485" y2="150" style="stroke:var(--line);stroke-width:1.4" stroke-dasharray="4 3"/>
+    </g>
+    <text x="91" y="82" text-anchor="middle" style="fill:var(--ink);font-family:var(--font-mono);font-size:10px">ingest cart</text>
+    <text x="91" y="98" text-anchor="middle" style="fill:var(--rollback);font-family:var(--font-mono);font-size:10px">not searchable</text>
+    <text x="288" y="82" text-anchor="middle" style="fill:var(--ink);font-family:var(--font-mono);font-size:10px">datadb buffer</text>
+    <text x="288" y="98" text-anchor="middle" style="fill:var(--rollback);font-family:var(--font-mono);font-size:10px">still not</text>
+    <text x="485" y="82" text-anchor="middle" style="fill:var(--ink);font-family:var(--font-mono);font-size:10px">in-memory part</text>
+    <text x="485" y="98" text-anchor="middle" style="fill:var(--accent2);font-family:var(--font-mono);font-size:10px">searchable ✓</text>
+    <text x="654" y="82" text-anchor="middle" style="fill:var(--ink);font-family:var(--font-mono);font-size:10px">disk</text>
+    <text x="654" y="98" text-anchor="middle" style="fill:var(--accent2);font-family:var(--font-mono);font-size:10px">durable ✓</text>
+    <text x="288" y="40" text-anchor="middle" style="fill:var(--ink-soft);font-family:var(--font-hand);font-size:12px">MustClose flush</text>
+    <text x="410" y="40" text-anchor="middle" style="fill:var(--ink-soft);font-family:var(--font-hand);font-size:12px">AfterFunc(~1s)</text>
+    <text x="100" y="172" text-anchor="middle" style="fill:var(--ink-soft);font-family:var(--font-hand);font-size:12px">◂ Post 1 (ingest) ▸</text>
+    <text x="520" y="172" text-anchor="middle" style="fill:var(--ink-soft);font-family:var(--font-hand);font-size:12px">◂ Post 2 / 3 (storage) ▸</text>
+  </svg>
+</Figure>
+
+So the honest phrasing for the post: *a freshly ingested row isn't searchable for ~1–2s — the ingest buffer hands it to storage immediately on request close, but the storage layer buffers it ~1s more before building the in-memory part queries read.* That timer is a storage-layer (Post 3) mechanism, **not** the ingest cart. Tests skip the wait with `DebugFlush`.
+
+### streamID — four doors, one formula
+
+Post 0 taught the **recipe**: a streamID is `tenant + hash128` of the chosen stream fields, sorted into a canonical form so order never matters. What Post 0 left open is the ingest-time question: when a raw row arrives, *how does VictoriaLogs know which fields are the stream fields?* Because the protocols disagree, `MustAdd` (`log_rows.go:359`) offers **four doors** into the same recipe.
+
+<Figure caption="Four doors, one formula. Three ways a row inside MustAdd declares its stream fields — by position, by configured name, or by an embedded _stream label — plus a native door where the id was already computed upstream in a cluster. All of them converge on the same recipe: sort to canonical bytes, hash, prepend the tenant.">
+  <svg viewBox="0 0 720 300" role="img" aria-label="Four doors to the streamID formula" style="width:100%;height:auto">
+    <defs><filter id="rl14" x="-3%" y="-5%" width="106%" height="110%"><feTurbulence type="fractalNoise" baseFrequency="0.012" numOctaves="2" seed="9" result="n"/><feDisplacementMap in="SourceGraphic" in2="n" scale="1.5"/></filter><marker id="ah14" markerWidth="9" markerHeight="9" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" style="fill:var(--ink-soft)"/></marker></defs>
+    <g filter="url(#rl14)">
+      <rect x="16" y="20" width="210" height="40" rx="8" style="fill:var(--panel);stroke:var(--accent);stroke-width:1.6"/>
+      <rect x="16" y="76" width="210" height="40" rx="8" style="fill:var(--panel);stroke:var(--accent);stroke-width:1.6"/>
+      <rect x="16" y="132" width="210" height="40" rx="8" style="fill:var(--panel);stroke:var(--accent);stroke-width:1.6"/>
+      <rect x="16" y="210" width="210" height="40" rx="8" style="fill:var(--panel);stroke:var(--line);stroke-width:1.6" stroke-dasharray="6 4"/>
+      <rect x="300" y="80" width="150" height="72" rx="11" style="fill:color-mix(in srgb,var(--accent2) 10%,var(--panel));stroke:var(--accent2);stroke-width:1.9"/>
+      <line x1="226" y1="40" x2="298" y2="100" style="stroke:var(--ink-soft);stroke-width:1.4;fill:none"/>
+      <line x1="226" y1="96" x2="298" y2="112" style="stroke:var(--ink-soft);stroke-width:1.4;fill:none" marker-end="url(#ah14)"/>
+      <line x1="226" y1="152" x2="298" y2="128" style="stroke:var(--ink-soft);stroke-width:1.4;fill:none"/>
+      <line x1="450" y1="116" x2="508" y2="116" style="stroke:var(--ink-soft);stroke-width:1.8;fill:none" marker-end="url(#ah14)"/>
+      <rect x="510" y="96" width="196" height="40" rx="8" style="fill:var(--panel);stroke:var(--accent);stroke-width:1.8"/>
+      <line x1="226" y1="230" x2="608" y2="230" style="stroke:var(--ink-soft);stroke-width:1.4;fill:none" stroke-dasharray="5 4"/>
+      <line x1="608" y1="230" x2="608" y2="140" style="stroke:var(--ink-soft);stroke-width:1.4;fill:none" marker-end="url(#ah14)"/>
+    </g>
+    <text x="121" y="44" text-anchor="middle" style="fill:var(--ink);font-family:var(--font-mono);font-size:11px">A · first N fields</text>
+    <text x="121" y="100" text-anchor="middle" style="fill:var(--ink);font-family:var(--font-mono);font-size:11px">B · configured names</text>
+    <text x="121" y="156" text-anchor="middle" style="fill:var(--ink);font-family:var(--font-mono);font-size:11px">C · embedded _stream</text>
+    <text x="121" y="234" text-anchor="middle" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:11px">native · precomputed</text>
+    <text x="121" y="196" text-anchor="middle" style="fill:var(--ink-soft);font-family:var(--font-hand);font-size:11px">inside MustAdd</text>
+    <text x="375" y="112" text-anchor="middle" style="fill:var(--ink);font-family:var(--font-mono);font-size:11px">Marshal</text>
+    <text x="375" y="128" text-anchor="middle" style="fill:var(--ink);font-family:var(--font-mono);font-size:11px">Canonical</text>
+    <text x="375" y="70" text-anchor="middle" style="fill:var(--accent2);font-family:var(--font-hand);font-size:12px">sort → bytes</text>
+    <text x="608" y="121" text-anchor="middle" style="fill:var(--ink);font-family:var(--font-mono);font-size:11px">hash128 → streamID</text>
+  </svg>
+</Figure>
+
+Inside `MustAdd`, which door is taken is a plain if / else-if / else:
+
+- **Door A — positional** (`streamFieldsLen >= 0`): the first `N` fields *are* the stream fields. OpenTelemetry and Loki, where the protocol already groups identity fields up front.
+- **Door B — configured names**: walk all fields, keep the ones whose name is in the request's `_stream_fields` list. jsonline, Elasticsearch, Datadog, Splunk — this is the `_stream_fields=service` route.
+- **Door C — embedded `_stream`**: the row already carries a `{service="api"}` label (re-importing VL's own exported logs); parse it back. No label either → the single empty stream `{}`.
+- **The native door** (`MustAddInsertRow`): in a cluster the id was computed once at the edge and shipped precomputed, so this door skips the recipe entirely.
+
+Then all of them converge:
+
+```go
+bb.B = st.MarshalCanonical(bb.B)   // sort tags → canonical bytes (order-independent)
+sid.tenantID = tenantID
+sid.id = hash128(bb.B)             // the 128-bit hash
+```
+
+<MarginNote>
+  <b>A stream field is identity <i>and</i> stored.</b> Doors A and B only <em>copy</em> a field into the tags — they never remove it from the row. So <code>service=api</code> becomes part of the id <b>and</b> stays a stored column. Only a client-sent <code>_stream</code>/<code>_stream_id</code> gets blanked, because VictoriaLogs regenerates those itself. And only the stream fields are hashed — put a high-cardinality field in there and you get a stream per line.
+</MarginNote>
+
+### The gate and the layout
+
+The streamID done, the row reaches `mustAddInternal` (`log_rows.go:428`) — the last stop in this post. It does two jobs: check the row is allowed in, then lay it into the cart in a deliberately odd shape.
+
+#### The gate — three limits
+
+Fail any one, and the **whole row** is dropped with a throttled warning:
+
+<Table
+  headers={['Check', 'Limit', 'Why']}
+  rows={[
+    ['fields per row', '<b>2000</b>', 'bounds the columns in a block'],
+    ['field-name length', '<b>128 bytes</b>', 'names become column metadata — keep it small'],
+    ['estimated row size', '<b>2 MiB</b>', 'one row must fit inside one block'],
+  ]}
+/>
+
+A normal log — a handful of short-named fields, a few KB — sails straight through. The gate only exists to refuse the pathological row that would wreck the on-disk format later.
+
+#### Structure of arrays
+
+You'd expect the cart to keep a list of rows, each row a self-contained bundle of its time, id, and fields. It does the opposite: it keeps several **parallel columns**, and reconstructs row `i` by reading index `i` from each.
+
+<Figure caption="The cart stores columns, not rows. streamIDs, timestamps, the canonical stream tags, and each row's field-window are separate parallel arrays joined by one index. This shape is chosen now so Post 2's sort by (streamID, timestamp) is cheap — you shuffle small keys, not bulky field text — and Post 4's transpose into on-disk columns is natural.">
+  <svg viewBox="0 0 720 220" role="img" aria-label="Structure-of-arrays layout" style="width:100%;height:auto">
+    <defs><filter id="rl15" x="-3%" y="-6%" width="106%" height="112%"><feTurbulence type="fractalNoise" baseFrequency="0.012" numOctaves="2" seed="1" result="n"/><feDisplacementMap in="SourceGraphic" in2="n" scale="1.4"/></filter></defs>
+    <g filter="url(#rl15)">
+      <rect x="150" y="30" width="90" height="34" rx="5" style="fill:color-mix(in srgb,var(--accent2) 14%,var(--panel));stroke:var(--accent2);stroke-width:1.5"/>
+      <rect x="150" y="74" width="90" height="34" rx="5" style="fill:color-mix(in srgb,var(--accent2) 14%,var(--panel));stroke:var(--accent2);stroke-width:1.5"/>
+      <rect x="150" y="118" width="90" height="34" rx="5" style="fill:color-mix(in srgb,var(--accent2) 14%,var(--panel));stroke:var(--accent2);stroke-width:1.5"/>
+      <rect x="150" y="162" width="90" height="34" rx="5" style="fill:var(--panel);stroke:var(--line);stroke-width:1.4"/>
+      <rect x="260" y="30" width="90" height="34" rx="5" style="fill:color-mix(in srgb,var(--accent2) 14%,var(--panel));stroke:var(--accent2);stroke-width:1.5"/>
+      <rect x="260" y="74" width="90" height="34" rx="5" style="fill:color-mix(in srgb,var(--accent2) 14%,var(--panel));stroke:var(--accent2);stroke-width:1.5"/>
+      <rect x="260" y="118" width="90" height="34" rx="5" style="fill:color-mix(in srgb,var(--accent2) 14%,var(--panel));stroke:var(--accent2);stroke-width:1.5"/>
+      <rect x="260" y="162" width="90" height="34" rx="5" style="fill:var(--panel);stroke:var(--line);stroke-width:1.4"/>
+      <rect x="370" y="30" width="120" height="34" rx="5" style="fill:color-mix(in srgb,var(--accent2) 14%,var(--panel));stroke:var(--accent2);stroke-width:1.5"/>
+      <rect x="370" y="74" width="120" height="34" rx="5" style="fill:color-mix(in srgb,var(--accent2) 14%,var(--panel));stroke:var(--accent2);stroke-width:1.5"/>
+      <rect x="370" y="118" width="120" height="34" rx="5" style="fill:color-mix(in srgb,var(--accent2) 14%,var(--panel));stroke:var(--accent2);stroke-width:1.5"/>
+      <rect x="370" y="162" width="120" height="34" rx="5" style="fill:var(--panel);stroke:var(--line);stroke-width:1.4"/>
+      <rect x="510" y="30" width="150" height="34" rx="5" style="fill:var(--panel);stroke:var(--accent);stroke-width:1.5"/>
+      <rect x="510" y="74" width="150" height="34" rx="5" style="fill:var(--panel);stroke:var(--accent);stroke-width:1.5"/>
+      <rect x="510" y="118" width="150" height="34" rx="5" style="fill:var(--panel);stroke:var(--accent);stroke-width:1.5"/>
+      <rect x="510" y="162" width="150" height="34" rx="5" style="fill:var(--panel);stroke:var(--line);stroke-width:1.4"/>
+    </g>
+    <text x="100" y="52" text-anchor="end" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:10px">i=0</text>
+    <text x="100" y="96" text-anchor="end" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:10px">i=1</text>
+    <text x="100" y="140" text-anchor="end" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:10px">i=2</text>
+    <text x="195" y="20" text-anchor="middle" style="fill:var(--ink);font-family:var(--font-mono);font-size:10px">streamIDs</text>
+    <text x="305" y="20" text-anchor="middle" style="fill:var(--ink);font-family:var(--font-mono);font-size:10px">timestamps</text>
+    <text x="430" y="20" text-anchor="middle" style="fill:var(--ink);font-family:var(--font-mono);font-size:10px">streamTags</text>
+    <text x="585" y="20" text-anchor="middle" style="fill:var(--ink);font-family:var(--font-mono);font-size:10px">rows (field windows)</text>
+    <text x="195" y="52" text-anchor="middle" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:10px">S_api</text>
+    <text x="195" y="96" text-anchor="middle" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:10px">S_api</text>
+    <text x="195" y="140" text-anchor="middle" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:10px">S_db</text>
+    <text x="305" y="52" text-anchor="middle" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:10px">09:01</text>
+    <text x="305" y="96" text-anchor="middle" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:10px">09:02</text>
+    <text x="305" y="140" text-anchor="middle" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:10px">09:03</text>
+    <text x="430" y="52" text-anchor="middle" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:10px">service=api</text>
+    <text x="430" y="96" text-anchor="middle" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:10px">(reuse ↑)</text>
+    <text x="430" y="140" text-anchor="middle" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:10px">service=db</text>
+    <text x="585" y="52" text-anchor="middle" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:10px">window →</text>
+    <text x="585" y="96" text-anchor="middle" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:10px">window →</text>
+    <text x="585" y="140" text-anchor="middle" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:10px">window →</text>
+    <text x="360" y="186" text-anchor="middle" style="fill:var(--ink-soft);font-family:var(--font-hand);font-size:12px">one index ties a row across all columns</text>
+  </svg>
+</Figure>
+
+The payoffs are both downstream, but the shape is locked in now: separated key arrays make Post 2's sort by `(streamID, timestamp)` cheap (shuffle small keys and slice headers, not field bytes), and starting from columns makes Post 4's transpose to on-disk columns natural.
+
+#### Store once — the repetition trick
+
+The field text itself gets one more optimization, and it exploits the Post-0 fact that logs are massively repetitive. When a field is identical to the field in the **same column of the row directly above**, VictoriaLogs doesn't write the text again — it reuses it, like a ditto mark in a hand-written ledger (`addFieldsInternal`, `log_rows.go:489`).
+
+<Figure caption="Logs repeat, so repeated field values are stored once. A field identical to the one in the same column of the previous row is reused (a ditto mark), not rewritten. Here only the message changes line to line, so service and level cost nothing after the first row — foreshadowing the dictionary and const-column encodings of Post 4.">
+  <svg viewBox="0 0 720 196" role="img" aria-label="Adjacent-duplicate reuse" style="width:100%;height:auto">
+    <defs><filter id="rl16" x="-3%" y="-8%" width="106%" height="116%"><feTurbulence type="fractalNoise" baseFrequency="0.012" numOctaves="2" seed="6" result="n"/><feDisplacementMap in="SourceGraphic" in2="n" scale="1.4"/></filter></defs>
+    <g filter="url(#rl16)">
+      <rect x="120" y="34" width="170" height="34" rx="5" style="fill:color-mix(in srgb,var(--accent2) 16%,var(--panel));stroke:var(--accent2);stroke-width:1.5"/>
+      <rect x="300" y="34" width="150" height="34" rx="5" style="fill:color-mix(in srgb,var(--accent2) 16%,var(--panel));stroke:var(--accent2);stroke-width:1.5"/>
+      <rect x="460" y="34" width="160" height="34" rx="5" style="fill:color-mix(in srgb,var(--accent2) 16%,var(--panel));stroke:var(--accent2);stroke-width:1.5"/>
+      <rect x="120" y="78" width="170" height="34" rx="5" style="fill:var(--panel);stroke:var(--line);stroke-width:1.3"/>
+      <rect x="300" y="78" width="150" height="34" rx="5" style="fill:var(--panel);stroke:var(--line);stroke-width:1.3"/>
+      <rect x="460" y="78" width="160" height="34" rx="5" style="fill:color-mix(in srgb,var(--accent2) 16%,var(--panel));stroke:var(--accent2);stroke-width:1.5"/>
+      <rect x="120" y="122" width="170" height="34" rx="5" style="fill:color-mix(in srgb,var(--accent2) 16%,var(--panel));stroke:var(--accent2);stroke-width:1.5"/>
+      <rect x="300" y="122" width="150" height="34" rx="5" style="fill:color-mix(in srgb,var(--accent2) 16%,var(--panel));stroke:var(--accent2);stroke-width:1.5"/>
+      <rect x="460" y="122" width="160" height="34" rx="5" style="fill:color-mix(in srgb,var(--accent2) 16%,var(--panel));stroke:var(--accent2);stroke-width:1.5"/>
+    </g>
+    <text x="110" y="56" text-anchor="end" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:10px">row0</text>
+    <text x="110" y="100" text-anchor="end" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:10px">row1</text>
+    <text x="110" y="144" text-anchor="end" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:10px">row2</text>
+    <text x="205" y="26" text-anchor="middle" style="fill:var(--ink);font-family:var(--font-mono);font-size:10px">service</text>
+    <text x="375" y="26" text-anchor="middle" style="fill:var(--ink);font-family:var(--font-mono);font-size:10px">level</text>
+    <text x="540" y="26" text-anchor="middle" style="fill:var(--ink);font-family:var(--font-mono);font-size:10px">_msg</text>
+    <text x="205" y="56" text-anchor="middle" style="fill:var(--ink);font-family:var(--font-mono);font-size:11px">api</text>
+    <text x="375" y="56" text-anchor="middle" style="fill:var(--ink);font-family:var(--font-mono);font-size:11px">info</text>
+    <text x="540" y="56" text-anchor="middle" style="fill:var(--ink);font-family:var(--font-mono);font-size:11px">started</text>
+    <text x="205" y="100" text-anchor="middle" style="fill:var(--ink-soft);font-family:var(--font-hand);font-size:14px">〃</text>
+    <text x="375" y="100" text-anchor="middle" style="fill:var(--ink-soft);font-family:var(--font-hand);font-size:14px">〃</text>
+    <text x="540" y="100" text-anchor="middle" style="fill:var(--ink);font-family:var(--font-mono);font-size:11px">ok</text>
+    <text x="205" y="144" text-anchor="middle" style="fill:var(--ink);font-family:var(--font-mono);font-size:11px">db</text>
+    <text x="375" y="144" text-anchor="middle" style="fill:var(--ink);font-family:var(--font-mono);font-size:11px">error</text>
+    <text x="540" y="144" text-anchor="middle" style="fill:var(--ink);font-family:var(--font-mono);font-size:11px">timeout</text>
+    <text x="360" y="182" text-anchor="middle" style="fill:var(--ink-soft);font-family:var(--font-hand);font-size:12px">〃 = reuse the value above — zero new bytes</text>
+  </svg>
+</Figure>
+
+Before that, each field runs a quick filter — empty values are dropped (empty = missing), `_time` is dropped (it lives in the `timestamps` column), `_stream`/`_stream_id` are rejected, and `_msg` is canonicalized to the empty name. And one guarantee: every stored row ends up with a `_msg`, falling back to `-defaultMsgValue` if the line had none.
+
+Be precise about the limits of what we've built: this is **not yet columnar** (each row's fields are still grouped in its window), and **not yet sorted**. The sort by `(streamID, timestamp)`, the transpose into real columns, and the freeze into an immutable part all happen past the socket — and that's where Post 2 opens.
+
+### Where this post ends
+
+```text
+HTTP POST /insert/jsonline (bytes)
+  │ parse+flatten · extract _time · rename _msg       ← Module 2
+  ▼ (timestamp, []Field) ──▶ lmp.AddRow
+  │ accumulate in one pooled cart; flush on size/time/close   ← Module 3
+  ▼ MustAdd
+  │ pick a door → MarshalCanonical → hash128 → streamID        ← Module 4
+  ▼ mustAddInternal
+  │ gate (2000/128B/2MiB) · drop empties · store-once · SoA     ← Module 5
+  ▼ [ cart: arrival order · not sorted · not columnar ]
+  ═══ the socket: MustAddRows ═══  ← Post 1 ends here
+  ▼ storage buffers ~1s → in-memory part (searchable)          ← Post 2 / 3
+```
+
+### Do it yourself — prove the row was shaped
+
+Everything above you can watch on the running server from Post 0. Ingest one line, naming `service` as the stream field, then read it back:
+
+```sh
+curl -X POST 'http://localhost:9428/insert/jsonline?_time_field=ts&_msg_field=message&_stream_fields=service' \
+  -H 'Content-Type: application/json' \
+  --data-binary '{"ts":"2026-11-01T09:00:00Z","message":"boom","service":"api","level":"error","req":{"path":"/x","ms":12}}'
+
+# wait ~1-2s (the visibility gap), then read it back
+curl http://localhost:9428/select/logsql/query -d 'query=service:api | sort by (_time)'
+```
+
+What comes back proves every transformation at once:
+
+```json
+{ "_msg":"boom", "_stream":"{service=\"api\"}",
+  "_stream_id":"0000000000000000 06ea53c6272f075b2cc7f8692a30c236",
+  "_time":"2026-11-01T09:00:00Z",
+  "level":"error", "req.ms":"12", "req.path":"/x", "service":"api" }
+```
+
+`req` was **flattened** to `req.path` / `req.ms`; `req.ms` is the **string** `"12"`; `ts` was **extracted** to `_time` and is gone as a field; `message` was **renamed** to `_msg`; the `_stream_id` is `tenant(0,0) + hash128`; and `service=api` is in `_stream` **and** still a stored field — identity *and* stored.
+
+And a probe for the streamID rules — ingest a few variants and count the distinct ids:
+
+<Table
+  headers={['Ingested', '_stream_id', 'Proves']}
+  rows={[
+    ['<code>app, pod, msg:a</code>', '…114142fbb…', 'baseline'],
+    ['<code>pod, app, msg:b</code> (reversed)', '…114142fbb… (same)', 'order-independent (canonical sort)'],
+    ['<code>app, pod, msg:c, level:debug</code>', '…114142fbb… (same)', 'non-stream field ignored by the hash'],
+    ['<code>app, pod:p9, msg:d</code>', '…e1a0fd79… (different)', 'a new stream-field value → a new stream'],
+  ]}
+/>
+
+<MarginNote>
+  <b>The silent-drop gotcha.</b> If the line's <code>_time</code> is in the <em>future</em> relative to the server's UTC clock, the row is dropped and the query simply returns nothing — no error. If a row seems to vanish, check <code>vl_rows_ingested_total</code> on <code>/metrics</code> before debugging anything else.
+</MarginNote>
+
+### What you now know
+
+<ol class="steps">
+  <li>Before you can be fast you must decide <b>what you store</b>. The naive store says "a line of text"; VictoriaLogs says "a typed row that already knows its stream" — and it decides this at the <b>front door</b>.</li>
+  <li>~10 protocols funnel into one neutral shape, <code>(timestamp, []Field)</code>, via three transformations — <b>flatten</b>, <b>extract <code>_time</code></b>, <b>rename <code>_msg</code></b> — all driven by the per-request <span class="ink-accent">CommonParams</span>.</li>
+  <li>Rows pile into <b>one pooled buffer</b> per request, flushed by size, a ~1s timer, or close — and pushed through a <b>two-method socket</b> that is the entire single-node-vs-cluster fork.</li>
+  <li>The <span class="ink-accent">streamID</span> is one recipe reached by <b>four doors</b>; a stream field is <b>identity and stored</b>, and only stream fields are hashed.</li>
+  <li>In the buffer, a row is laid out as <b>parallel columns</b>, not a bundle, with repeated field values <b>stored once</b> — a shape chosen to make the next post's sort and columns cheap.</li>
+</ol>
+
+The row is now in memory: stamped with its stream, in arrival order, **not sorted and not yet a file**. Next we cross the socket and watch that pile of rows become a sorted, columnar, immutable **part** — the first real on-disk artifact of the engine.
+
+One line, the whole journey — follow the **`line ▸` strip** down the page and watch the *same log* change shape at every stage, while the mechanism around it (counters, flush triggers, the hash recipe, the gate) explains why:
+
+<Figure caption="The whole of Post 1, following one log line. Read the accented 'line ▸' strip in each card — that is the same record, transformed stage by stage: raw nested JSON on the wire; then flattened and renamed into the neutral _time/_msg/field form; then tallied as a numbered row in the pooled buffer; then stamped with a streamID hashed from its stream fields; then scattered across parallel columns at its index i (a repeat value kept once as a ditto ↑); and finally shipped inside the LogRows across the two-method socket. The text above each strip is the concept at that stage. The spotlight on the left spine marks where the line is right now; crossing the socket is where ingest ends — the storage layer (Post 2/3) sorts and writes it, and it turns searchable about a second later.">
+  <svg viewBox="0 0 640 824" role="img" aria-label="Animated end-to-end Post 1 pipeline following one log line as it changes shape at each stage" style="width:100%;height:auto">
+    <defs>
+      <filter id="rl17" x="-2%" y="-2%" width="104%" height="104%"><feTurbulence type="fractalNoise" baseFrequency="0.011" numOctaves="2" seed="4" result="n"/><feDisplacementMap in="SourceGraphic" in2="n" scale="1.4"/></filter>
+      <marker id="ah17" markerWidth="9" markerHeight="9" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" style="fill:var(--accent)"/></marker>
+    </defs>
+    <g filter="url(#rl17)">
+      <line x1="40" y1="110" x2="40" y2="714" style="stroke:var(--line);stroke-width:2;fill:none"/>
+      <rect x="72" y="60" width="548" height="108" rx="13" style="fill:var(--panel);stroke:var(--accent);stroke-width:1.6"/>
+      <rect x="72" y="182" width="548" height="108" rx="13" style="fill:var(--panel);stroke:var(--accent);stroke-width:1.6"/>
+      <rect x="72" y="304" width="548" height="108" rx="13" style="fill:var(--panel);stroke:var(--accent);stroke-width:1.6"/>
+      <rect x="72" y="426" width="548" height="108" rx="13" style="fill:var(--panel);stroke:var(--accent);stroke-width:1.6"/>
+      <rect x="72" y="548" width="548" height="108" rx="13" style="fill:var(--panel);stroke:var(--accent);stroke-width:1.6"/>
+      <rect x="72" y="670" width="548" height="108" rx="13" style="fill:color-mix(in srgb,var(--accent2) 9%,var(--panel));stroke:var(--accent2);stroke-width:1.8"/>
+      <line x1="56" y1="114" x2="71" y2="114" style="stroke:var(--accent);stroke-width:1.5;fill:none" marker-end="url(#ah17)"/>
+      <line x1="56" y1="236" x2="71" y2="236" style="stroke:var(--accent);stroke-width:1.5;fill:none" marker-end="url(#ah17)"/>
+      <line x1="56" y1="358" x2="71" y2="358" style="stroke:var(--accent);stroke-width:1.5;fill:none" marker-end="url(#ah17)"/>
+      <line x1="56" y1="480" x2="71" y2="480" style="stroke:var(--accent);stroke-width:1.5;fill:none" marker-end="url(#ah17)"/>
+      <line x1="56" y1="602" x2="71" y2="602" style="stroke:var(--accent);stroke-width:1.5;fill:none" marker-end="url(#ah17)"/>
+      <line x1="56" y1="724" x2="71" y2="724" style="stroke:var(--accent2);stroke-width:1.5;fill:none" marker-end="url(#ah17)"/>
+      <line x1="80" y1="792" x2="612" y2="792" style="stroke:var(--line);stroke-width:1.4;fill:none" stroke-dasharray="6 4"/>
+    </g>
+
+    <circle cx="40" cy="114" r="15" style="fill:var(--panel);stroke:var(--accent);stroke-width:1.8"/>
+    <circle cx="40" cy="236" r="15" style="fill:var(--panel);stroke:var(--accent);stroke-width:1.8"/>
+    <circle cx="40" cy="358" r="15" style="fill:var(--panel);stroke:var(--accent);stroke-width:1.8"/>
+    <circle cx="40" cy="480" r="15" style="fill:var(--panel);stroke:var(--accent);stroke-width:1.8"/>
+    <circle cx="40" cy="602" r="15" style="fill:var(--panel);stroke:var(--accent);stroke-width:1.8"/>
+    <circle cx="40" cy="724" r="15" style="fill:var(--panel);stroke:var(--accent2);stroke-width:1.8"/>
+    <text x="40" y="118" text-anchor="middle" style="fill:var(--ink);font-family:var(--font-hand);font-size:13px;font-weight:700">1</text>
+    <text x="40" y="240" text-anchor="middle" style="fill:var(--ink);font-family:var(--font-hand);font-size:13px;font-weight:700">2</text>
+    <text x="40" y="362" text-anchor="middle" style="fill:var(--ink);font-family:var(--font-hand);font-size:13px;font-weight:700">3</text>
+    <text x="40" y="484" text-anchor="middle" style="fill:var(--ink);font-family:var(--font-hand);font-size:13px;font-weight:700">4</text>
+    <text x="40" y="606" text-anchor="middle" style="fill:var(--ink);font-family:var(--font-hand);font-size:13px;font-weight:700">5</text>
+    <text x="40" y="728" text-anchor="middle" style="fill:var(--ink);font-family:var(--font-hand);font-size:13px;font-weight:700">6</text>
+
+    <g>
+      <rect x="88" y="138" width="528" height="22" rx="6" style="fill:color-mix(in srgb,var(--accent2) 12%,var(--panel));stroke:var(--accent2);stroke-width:1.1"/>
+      <rect x="88" y="260" width="528" height="22" rx="6" style="fill:color-mix(in srgb,var(--accent2) 12%,var(--panel));stroke:var(--accent2);stroke-width:1.1"/>
+      <rect x="88" y="382" width="528" height="22" rx="6" style="fill:color-mix(in srgb,var(--accent2) 16%,var(--panel));stroke:var(--accent2);stroke-width:1.3;opacity:0"><animate attributeName="opacity" dur="12s" begin="4.44s" repeatCount="indefinite" keyTimes="0;0.02;0.06;1" values="0;0;1;1"/></rect>
+      <rect x="88" y="504" width="528" height="22" rx="6" style="fill:color-mix(in srgb,var(--accent2) 12%,var(--panel));stroke:var(--accent2);stroke-width:1.1"/>
+      <rect x="88" y="626" width="528" height="22" rx="6" style="fill:color-mix(in srgb,var(--accent2) 12%,var(--panel));stroke:var(--accent2);stroke-width:1.1"/>
+      <rect x="88" y="748" width="528" height="22" rx="6" style="fill:color-mix(in srgb,var(--accent2) 14%,var(--panel));stroke:var(--accent2);stroke-width:1.2"/>
+    </g>
+
+    <text x="90" y="82" style="fill:var(--ink);font-family:var(--font-hand);font-size:14px;font-weight:700">Raw bytes arrive on the wire</text>
+    <text x="604" y="82" text-anchor="end" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:9.5px">vlinsert/jsonline</text>
+    <text x="90" y="106" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:10.5px">nested JSON · stringly-typed · ~10 wire protocols funnel to one call</text>
+    <text x="98" y="153" style="fill:var(--accent2);font-family:var(--font-mono);font-size:10.5px;font-weight:700">line ▸</text>
+    <text x="140" y="153" style="fill:var(--ink);font-family:var(--font-mono);font-size:10.5px">&#123; time, msg:boom, level:error, service:api, req:&#123;path:/x, ms:12&#125; &#125;</text>
+
+    <text x="90" y="204" style="fill:var(--ink);font-family:var(--font-hand);font-size:14px;font-weight:700">Three transformations → the neutral shape</text>
+    <text x="604" y="204" text-anchor="end" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:9.5px">ParseLogMessage · RenameField</text>
+    <text x="90" y="228" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:10.5px">flatten req:&#123;path&#125; → req.path · extract time → _time</text>
+    <text x="90" y="244" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:10.5px">rename msg → _msg    (nesting gone; flat, ordered Fields)</text>
+    <text x="98" y="275" style="fill:var(--accent2);font-family:var(--font-mono);font-size:10.5px;font-weight:700">line ▸</text>
+    <text x="140" y="275" style="fill:var(--ink);font-family:var(--font-mono);font-size:10.5px">_time · _msg:boom · level:error · service:api · req.path:/x · req.ms:12</text>
+
+    <text x="90" y="326" style="fill:var(--ink);font-family:var(--font-hand);font-size:14px;font-weight:700">Tallied into one pooled buffer</text>
+    <text x="604" y="326" text-anchor="end" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:9.5px">LogRows.MustAdd</text>
+    <text x="90" y="350" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:10.5px">unflushedRows += 1 · unflushedBytes += est</text>
+    <text x="90" y="366" style="fill:var(--ink-faint,var(--ink-soft));font-family:var(--font-mono);font-size:9.5px">flush when: &gt; 1.75 MB · ~20,971 rows · ~1 s · close</text>
+    <text x="98" y="397" style="fill:var(--accent2);font-family:var(--font-mono);font-size:10.5px;font-weight:700"><tspan>line ▸</tspan><animate attributeName="opacity" dur="12s" begin="4.44s" repeatCount="indefinite" keyTimes="0;0.02;0.06;1" values="0;0;1;1"/></text>
+    <text x="140" y="397" style="fill:var(--ink);font-family:var(--font-mono);font-size:10.5px"><tspan>buffer row #2 · _msg:boom · service:api · req.path:/x · …</tspan><animate attributeName="opacity" dur="12s" begin="4.44s" repeatCount="indefinite" keyTimes="0;0.02;0.06;1" values="0;0;1;1"/></text>
+
+    <text x="90" y="448" style="fill:var(--ink);font-family:var(--font-hand);font-size:14px;font-weight:700">Each row is stamped with a streamID</text>
+    <text x="604" y="448" text-anchor="end" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:9.5px">MarshalCanonical · hash128</text>
+    <text x="90" y="472" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:10.5px">&#123; service:api &#125; → canonical bytes (sorted) → hash128</text>
+    <text x="90" y="488" style="fill:var(--ink-faint,var(--ink-soft));font-family:var(--font-mono);font-size:9.5px">a stream field is identity AND stored — only stream fields hashed</text>
+    <text x="98" y="519" style="fill:var(--accent2);font-family:var(--font-mono);font-size:10.5px;font-weight:700">line ▸</text>
+    <text x="140" y="519" style="fill:var(--ink);font-family:var(--font-mono);font-size:10.5px">streamID …2a30c236  ⊕  _msg:boom · service:api · req.path:/x</text>
+
+    <text x="90" y="570" style="fill:var(--ink);font-family:var(--font-hand);font-size:14px;font-weight:700">Laid down as parallel columns</text>
+    <text x="604" y="570" text-anchor="end" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:9.5px">gate + structure-of-arrays</text>
+    <text x="90" y="594" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:10.5px">service [ api, ↑, ↑ ]  ← adjacent duplicate stored once (ditto)</text>
+    <text x="90" y="610" style="fill:var(--ink-faint,var(--ink-soft));font-family:var(--font-mono);font-size:9.5px">gate: ≤ 2000 fields · ≤ 2 MiB/row · columns joined by index i</text>
+    <text x="98" y="641" style="fill:var(--accent2);font-family:var(--font-mono);font-size:10.5px;font-weight:700">line ▸</text>
+    <text x="140" y="641" style="fill:var(--ink);font-family:var(--font-mono);font-size:10.5px">col[i=2] · _msg[2]:boom · service[2]:api↑ · req.path[2]:/x</text>
+
+    <text x="90" y="692" style="fill:var(--ink);font-family:var(--font-hand);font-size:14px;font-weight:700">Pushed across the socket</text>
+    <text x="604" y="692" text-anchor="end" style="fill:var(--accent2);font-family:var(--font-hand);font-size:12px">Post 1 ends here</text>
+    <text x="90" y="716" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:10.5px">logRowsStorage.MustAddRows(lr) · lr.ResetKeepSettings()</text>
+    <text x="90" y="732" style="fill:var(--ink-faint,var(--ink-soft));font-family:var(--font-mono);font-size:9.5px">storage sorts &amp; writes a part — searchable ~1 s later (Post 2/3)</text>
+    <text x="98" y="763" style="fill:var(--accent2);font-family:var(--font-mono);font-size:10.5px;font-weight:700">line ▸</text>
+    <text x="140" y="763" style="fill:var(--ink);font-family:var(--font-mono);font-size:10.5px">lr ▸ [ …, row#2(boom · api · /x), … ]  → shipped</text>
+    <text x="346" y="810" text-anchor="middle" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:9.5px">↓  into lib/logstorage  ↓</text>
+
+    <rect x="72" y="60" width="548" height="108" rx="13" style="fill:none;stroke:var(--accent2);stroke-width:2.5;opacity:0"><animate attributeName="opacity" dur="12s" begin="0s" repeatCount="indefinite" keyTimes="0;0.02;0.14;0.17;1" values="0;1;1;0;0"/></rect>
+    <rect x="72" y="182" width="548" height="108" rx="13" style="fill:none;stroke:var(--accent2);stroke-width:2.5;opacity:0"><animate attributeName="opacity" dur="12s" begin="2.4s" repeatCount="indefinite" keyTimes="0;0.02;0.14;0.17;1" values="0;1;1;0;0"/></rect>
+    <rect x="72" y="304" width="548" height="108" rx="13" style="fill:none;stroke:var(--accent2);stroke-width:2.5;opacity:0"><animate attributeName="opacity" dur="12s" begin="4.44s" repeatCount="indefinite" keyTimes="0;0.02;0.14;0.17;1" values="0;1;1;0;0"/></rect>
+    <rect x="72" y="426" width="548" height="108" rx="13" style="fill:none;stroke:var(--accent2);stroke-width:2.5;opacity:0"><animate attributeName="opacity" dur="12s" begin="6.36s" repeatCount="indefinite" keyTimes="0;0.02;0.14;0.17;1" values="0;1;1;0;0"/></rect>
+    <rect x="72" y="548" width="548" height="108" rx="13" style="fill:none;stroke:var(--accent2);stroke-width:2.5;opacity:0"><animate attributeName="opacity" dur="12s" begin="8.4s" repeatCount="indefinite" keyTimes="0;0.02;0.14;0.17;1" values="0;1;1;0;0"/></rect>
+    <rect x="72" y="670" width="548" height="108" rx="13" style="fill:none;stroke:var(--accent2);stroke-width:2.5;opacity:0"><animate attributeName="opacity" dur="12s" begin="10.44s" repeatCount="indefinite" keyTimes="0;0.02;0.2;0.3;1" values="0;1;1;0;0"/></rect>
+
+    <g>
+      <circle r="16" style="fill:var(--accent2);opacity:0.2"/>
+      <circle r="8" style="fill:var(--accent2)"/>
+      <circle r="3.5" style="fill:var(--panel)"/>
+      <animateMotion dur="12s" repeatCount="indefinite" calcMode="linear" path="M40,114 L40,236 L40,358 L40,480 L40,602 L40,724" keyPoints="0;0;0;0.2;0.2;0.4;0.4;0.6;0.6;0.8;0.8;1;1" keyTimes="0;0.03;0.17;0.20;0.34;0.37;0.53;0.56;0.70;0.73;0.87;0.90;1"/>
+    </g>
+  </svg>
+</Figure>

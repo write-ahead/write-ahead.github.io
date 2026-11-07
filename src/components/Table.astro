@@ -1,0 +1,39 @@
+---
+// A sketch-framed "ledger" table in the blog's hand-drawn system: ink header,
+// dashed row rules, no vertical lines, a mono accent on the first (key) column,
+// and horizontal scroll on narrow screens so a column never gets crushed.
+//
+// Cells accept inline HTML (<b>, <em>, <code>, links), so the usual markdown
+// emphasis survives the move out of | … | syntax.
+//
+//   <Table
+//     headers={['Field', 'What it is', 'The subtlety']}
+//     rows={[
+//       ['_msg', 'the log message', 'its name is the <b>empty string</b> …'],
+//       ['_time', 'the timestamp', 'it decides <b>which day-partition</b> …'],
+//     ]}
+//   />
+//
+// Pass `plain` to drop the mono accent on the first column (for tables with no
+// natural key column), and `caption` for a hand-written line underneath.
+interface Props {
+  headers: string[];
+  rows: string[][];
+  caption?: string;
+  plain?: boolean;
+}
+const { headers, rows, caption, plain = false } = Astro.props;
+---
+<figure class="ledger-wrap">
+  <table class:list={['ledger', { plain }]}>
+    <thead>
+      <tr>{headers.map((h) => <th set:html={h} />)}</tr>
+    </thead>
+    <tbody>
+      {rows.map((row) => (
+        <tr>{row.map((cell) => <td set:html={cell} />)}</tr>
+      ))}
+    </tbody>
+  </table>
+  {caption && <figcaption class="ledger-cap">{caption}</figcaption>}
+</figure>

@@ -1,0 +1,21 @@
+---
+import { getCollection, render } from 'astro:content';
+import ChapterLayout from '../layouts/ChapterLayout.astro';
+import { chapterHref } from '../utils/chapters';
+
+export async function getStaticPaths() {
+  const chapters = await getCollection('chapters', ({ data }) => data.status === 'posted');
+  return chapters.map((chapter) => ({
+    // chapterHref returns "/<path-or-id>"; the rest param wants it without the leading slash
+    params: { slug: chapterHref(chapter).slice(1) },
+    props: { chapter },
+  }));
+}
+
+const { chapter } = Astro.props;
+const { Content } = await render(chapter);
+---
+
+<ChapterLayout id={chapter.id} frontmatter={chapter.data}>
+  <Content />
+</ChapterLayout>

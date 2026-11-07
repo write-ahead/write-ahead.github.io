@@ -1,11 +1,8 @@
 ---
 import BaseLayout from '../layouts/BaseLayout.astro';
-import { getParts, getPublishedChapters } from '../utils/chapters';
+import { getParts, chapterHref } from '../utils/chapters';
 
-const parts = await getParts(true); // include drafts as "coming soon"
-const published = await getPublishedChapters();
-// reading-order number for each published chapter id
-const numberOf = new Map(published.map((c, i) => [c.id, i + 1]));
+const parts = await getParts(true); // posted + "coming soon" (drafts excluded)
 const fmt = (d: Date) =>
   new Date(d).toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' });
 ---
@@ -15,38 +12,39 @@ const fmt = (d: Date) =>
   <h1>How databases <em>actually</em> work, drawn by hand.</h1>
   <p class="lede">
     A slow walk through the inside of a database — pages, trees, logs, locks — rebuilt
-    from sketches and small animations instead of walls of code. Start at the first entry and
-    read it like a book.
+    from sketches and small animations instead of walls of code.
   </p>
 
   {parts.length === 0 ? (
-    <p class="byline">The first chapter is being written — check back soon.</p>
+    <p class="byline">The first entry is being written — check back soon.</p>
   ) : (
     parts.map((part) => (
       <section class="part">
         <div class="part-label">{part.name}</div>
-        <ol class="toc">
-          {part.chapters.map((ch) => {
-            const n = numberOf.get(ch.id);
-            const isDraft = !n;
-            return (
-              <li class:list={['toc-item', { draft: isDraft }]} data-sketch-frame>
-                <div class="toc-num">{n ?? '·'}</div>
+        <ul class="toc">
+          {part.chapters.map((ch) =>
+            ch.data.status === 'soon' ? (
+              <li class="soon-entry">
+                <div class="soon-entry-rule" aria-hidden="true">
+                  <span class="soon-entry-mark"></span>
+                </div>
+                <div class="soon-entry-body">
+                  <div class="soon-entry-tag">pending · coming soon</div>
+                  <h3 class="soon-entry-title">{ch.data.title}</h3>
+                  <p class="soon-entry-desc">{ch.data.description}</p>
+                </div>
+              </li>
+            ) : (
+              <li class="toc-item" data-sketch-frame>
                 <div class="toc-body">
-                  {isDraft ? (
-                    <span class="toc-title" style="color:var(--ink-soft)">
-                      {ch.data.title}<span class="soon">coming soon</span>
-                    </span>
-                  ) : (
-                    <a class="toc-title" href={`/chapters/${ch.id}`}>{ch.data.title}</a>
-                  )}
-                  {!isDraft && <div class="meta">{fmt(ch.data.pubDate)}</div>}
+                  <a class="toc-title" href={chapterHref(ch)}>{ch.data.title}</a>
+                  <div class="meta">{fmt(ch.data.pubDate)}</div>
                   <p>{ch.data.description}</p>
                 </div>
               </li>
-            );
-          })}
-        </ol>
+            )
+          )}
+        </ul>
       </section>
     ))
   )}

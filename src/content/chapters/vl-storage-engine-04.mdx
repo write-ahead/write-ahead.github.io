@@ -1,0 +1,10 @@
+---
+title: "VictoriaLogs storage internals: Columnar blocks"
+description: Open a block byte by byte. Fields are stored per column, not per row — each column typed, range-indexed with min/max, and compressed with dictionary and const encodings. This is where most of the "15x less disk" actually comes from.
+pubDate: 2026-11-24
+order: 4
+part: Log storage
+path: victorialogs/internals/storage-engine/columnar-blocks
+tags: ['log storage', 'victorialogs', 'columnar', 'encoding']
+status: soon
+---

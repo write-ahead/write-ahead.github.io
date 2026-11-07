@@ -1,6 +1,6 @@
 ---
 import BaseLayout from './BaseLayout.astro';
-import { slugifyTag, getNeighbors, getChapterNumber } from '../utils/chapters';
+import { slugifyTag, getNeighbors, chapterHref } from '../utils/chapters';
 
 interface Props {
   id: string;
@@ -15,7 +15,6 @@ interface Props {
 }
 const { id, frontmatter } = Astro.props;
 
-const number = await getChapterNumber(id);
 const { prev, next } = await getNeighbors(id);
 
 const date = new Date(frontmatter.pubDate).toLocaleDateString('en-US', {
@@ -27,10 +26,9 @@ const date = new Date(frontmatter.pubDate).toLocaleDateString('en-US', {
 
 <BaseLayout title={frontmatter.title} description={frontmatter.description} image={frontmatter.ogImage} type="article">
   <article data-pagefind-body>
-    <a class="back-link" href="/" data-pagefind-ignore>← the whole book</a>
+    <a class="back-link" href="/" data-pagefind-ignore>← the log</a>
     <div class="eyebrow" style="margin-top:14px;">
-      {number ? `Chapter ${number}` : 'Draft'}
-      <span class="dot">·</span> {frontmatter.part ?? 'Internals'}
+      {frontmatter.part ?? 'Internals'}
     </div>
     <h1>{frontmatter.title}</h1>
     <p class="byline">{date}</p>
@@ -48,13 +46,13 @@ const date = new Date(frontmatter.pubDate).toLocaleDateString('en-US', {
     {(prev || next) && (
       <nav class="chapter-nav" data-pagefind-ignore>
         {prev && (
-          <a class="prev" href={`/chapters/${prev.id}`}>
+          <a class="prev" href={chapterHref(prev)}>
             <div class="dir">← previous</div>
             <div class="ttl">{prev.data.title}</div>
           </a>
         )}
         {next && (
-          <a class="next" href={`/chapters/${next.id}`}>
+          <a class="next" href={chapterHref(next)}>
             <div class="dir">next →</div>
             <div class="ttl">{next.data.title}</div>
           </a>

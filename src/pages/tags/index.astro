@@ -6,9 +6,9 @@ const tags = await getAllTags();
 ---
 
 <BaseLayout title="Topics" description="Browse Write-Ahead by topic.">
-  <a class="back-link" href="/">← the book</a>
+  <a class="back-link" href="/">← the log</a>
   <h1 style="margin-top:14px;">Browse by topic</h1>
-  <p class="lede">Every chapter, sorted by what part of the engine it digs into.</p>
+  <p class="lede">Every entry, sorted by what part of the engine it digs into.</p>
 
   {tags.length === 0 ? (
     <p class="byline">No topics yet.</p>

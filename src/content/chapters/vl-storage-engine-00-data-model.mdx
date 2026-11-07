@@ -1,0 +1,410 @@
+---
+title: "VictoriaLogs storage internals: the data model and the map of the engine"
+description: The opening post of the series. We draw the map — the flat data model, the stream (a hash of the fields you choose, not a property of the log line), and the two LSM trees per day — then watch it all land on disk, file by file.
+pubDate: 2026-11-07
+order: 0
+part: Log storage
+path: victorialogs/internals/storage-engine/data-model
+tags: ['log storage', 'victorialogs', 'data model']
+status: posted
+ogImage: /og/vl-storage-engine-00-data-model.png
+---
+
+import StreamBuilder from '../../components/StreamBuilder.tsx';
+import ContainmentTree from '../../components/ContainmentTree.tsx';
+import RowsToBlocks from '../../components/RowsToBlocks.tsx';
+import PartAnatomy from '../../components/PartAnatomy.tsx';
+import Annotate from '../../components/Annotate.tsx';
+import VersusCard from '../../components/VersusCard.astro';
+import Table from '../../components/Table.astro';
+import Figure from '../../components/Figure.astro';
+import MarginNote from '../../components/MarginNote.astro';
+
+A log store eats a firehose: millions of lines an hour, from thousands of sources. Storing them
+is the easy part — a file and some disk will do. The hard part is getting *any of it back fast*:
+"show me the errors from this one pod in the last fifteen minutes," answered in milliseconds,
+over terabytes, without reading the other 99.99% of the data. Over this series we'll read one
+engine that pulls that off — [VictoriaLogs](https://docs.victoriametrics.com/victorialogs/) —
+from the bottom up, until "fast" stops looking like magic and starts looking like an obvious
+consequence of how the bytes are laid out.
+
+### Why this engine is worth reading
+
+The payoff is big enough to state up front. These are the project's **own published figures**
+— "up to *N*×", best case — not an independent benchmark, so treat them as the ceiling and
+measure on your own logs. Still, the direction isn't subtle:
+
+<div class="matchups">
+  <VersusCard opponent="Elasticsearch" stats={[
+    { big: '30×', lab: 'less RAM' },
+    { big: '15×', lab: 'less disk' },
+    { big: '27 → 1', lab: "nodes, one user's swap" },
+  ]}>
+    Same workload. One user reported replacing a <strong>27-node</strong> Elasticsearch
+    cluster with a <em>single</em> VictoriaLogs node.
+  </VersusCard>
+  <VersusCard opponent="Grafana Loki" stats={[
+    { big: '1000×', lab: 'faster full-text queries' },
+    { big: 'high-card', lab: 'fields handled, not feared' },
+  ]}>
+    Typical full-text queries up to 1000× faster — while handling the high-cardinality
+    fields <code>trace_id</code>, <code>ip</code> that make Loki struggle.
+  </VersusCard>
+</div>
+
+The interesting part, for us, is that every one of those numbers is a direct consequence of a
+design decision we're going to read — columnar storage, per-stream grouping, bloom filters,
+opt-in streams. The brag list is really a table of contents in disguise.
+
+### How we'll read it
+
+Every chapter after this one follows the same move — we build the **naive** version of one
+mechanism, hit the **wall** it runs into, then read how VictoriaLogs **actually** solves it.
+
+Two
+rules keep us honest, because a systems post that's confidently wrong is worse than no post at all:
+
+- Every non-obvious claim is anchored to the **real source**, checked against the current code.
+- The **tests are the oracle**: when a mental model disagrees with the engine's own test, the
+  model is wrong.
+
+Where are we headed:
+
+<ol class="steps">
+  <li><b>The data model</b> — fields, streams, tenants, and the map <i>(this chapter)</i>.</li>
+  <li><b>Append-only ingestion</b> — how a line gets in, and why "just append it" dies at the first query.</li>
+  <li><b>Sorting &amp; immutable parts</b> — turning a pile of lines into a frozen, searchable part.</li>
+  <li><b>The LSM merge engine</b> — the in-memory buffer and background merges that avoid a file per flush.</li>
+  <li><b>Columnar blocks</b> — per-column, typed, min/max, dictionary and const columns.</li>
+  <li><b>Full-text without scanning</b> — tokenization and bloom filters that skip blocks a query can't match.</li>
+  <li><b>The wide-events refactor</b> — the real history where 20-field logs caused ~1000× read amplification, and the fix.</li>
+  <li><b>The stream inverted index</b> — <code>indexdb</code>: resolving <code>{'{app="api"}'}</code> through postings set-algebra.</li>
+  <li><b>Partitions, retention &amp; the query flow</b> — every layer tied into one read pipeline.</li>
+</ol>
+
+One thing this series is *not* :
+
+A tour of the query language. LogsQL — its pipes and stats
+functions — is a big topic that deserves its own series; here we only follow how a query
+*executes against storage*, not its grammar.
+
+It all rests on one idea: the **stream**. Get the stream wrong and nothing else about the
+system quite makes sense — so that's where we'll start.
+
+Let's start with the atom. A log entry is just a flat bag of
+<Annotate client:visible type="underline">fields</Annotate> — `key = value` pairs, both
+strings:
+
+```json
+{ "app": "api", "pod": "api-7", "level": "error",
+  "trace_id": "t-aaa", "_msg": "db timeout" }
+```
+
+"Flat" and "strings" are enforced, not assumed — VictoriaLogs reshapes every incoming log into
+that form at ingest time. **Nested objects are flattened**, joining keys with a dot:
+
+```json
+{ "host": { "os": { "version": "1.2.3" } } }   →   { "host.os.version": "1.2.3" }
+```
+
+and **everything becomes a string** — arrays, numbers and booleans are all stringified, so
+full-text search works the same way over every field:
+
+```json
+{ "offset": 12345, "is_error": false }   →   { "offset": "12345", "is_error": "false" }
+```
+
+One more rule surprises people: **an empty value is the same as a missing field.**
+`{"_msg":"x","region":""}` and `{"_msg":"x"}` are identical to VictoriaLogs — the empty `region`
+is dropped before anything else happens. (Keep that one in mind; it quietly changes how a stream
+is computed, a few paragraphs down.)
+
+So the payload is nothing but a flat bag of string→string fields. All the structure that makes
+queries fast lives in how **four special field names** are treated — everything else is an
+ordinary "other" field:
+
+<Table
+  headers={['Field', 'What it is', 'The subtlety']}
+  rows={[
+    ['_msg', 'the log message', 'internally its name is the <b>empty string <code>""</code></b>, not <code>_msg</code> — and it gets its own files on disk, apart from every other column'],
+    ['_time', 'the timestamp', "it doesn't just power the time filter — it <b>decides which day-partition the line is stored in</b>. Time is physical layout here, not just a searchable value"],
+    ['_stream', 'the stream’s labels, <code>{k="v",…}</code>', '<b>derived, not ingested</b> — you don’t send it'],
+    ['_stream_id', 'a unique id for the stream', 'also derived — a hash, computed as the line comes in'],
+  ]}
+/>
+
+You send `_msg`, maybe `_time`, and your ordinary fields. The last two — `_stream` and
+`_stream_id` — **the engine derives for you.** And how it does that turns out to be the whole game.
+
+## A stream is a hash of the fields you choose
+
+A stream is meant to be "all the logs from one running instance." But the engine can't guess
+which fields identify an instance, so *you* tell it — you nominate a few
+<Annotate client:visible type="circle" token="--accent2">stream fields</Annotate> at ingestion
+time (say, `app` and `pod`). Those fields, **and only those**, become the line's identity.
+
+Toggle them below and watch what comes out:
+
+<Figure caption="Click a field to make it a stream field. The _stream label and _stream_id hash recompute from the chosen fields only — sorted, so order never matters. Add trace_id and watch it blow up.">
+  <StreamBuilder client:visible />
+</Figure>
+
+Three things that diagram is quietly proving, and each is a real property of the code:
+
+- **Only the stream fields count.** `level`, `trace_id`, even `_msg` change nothing about the
+  stream. Two lines with totally different messages are the
+  <Annotate client:visible type="box">same stream</Annotate> as long as `app` and `pod` match.
+  That's the whole point: putting one instance's lines together is what makes them compress
+  well and what lets an `{app="api"}` query skip everyone else's data.
+- **Order and empties don't matter.** The chosen fields are *sorted* into a canonical form
+  before hashing, and empty ones were already dropped. So `{pod, app}` and `{app, pod,
+  region=""}` land on the exact same stream.
+- **The id carries the tenant.** The real `_stream_id` is `tenant + hash128(tags)` — a pair of
+  account/project integers prepended to a 128-bit hash. That's why the id in the diagram starts
+  with a run of zeros: a single-tenant store is just tenant `(0, 0)`.
+
+<MarginNote>
+  <b>The one mistake to never make.</b> Put a high-cardinality field — `trace_id`, `ip`,
+  `user_id` — in your stream fields and *every line gets a unique hash*, i.e. its own stream.
+  Streams explode, ingestion crawls, memory balloons. It isn't a bug; it's the model doing
+  exactly what you asked. Those fields make great *ordinary* fields — searchable, just not
+  identity.
+</MarginNote>
+
+If you nominate *no* stream fields, every line falls into the single empty stream `{}`. It still
+works — you've just quietly thrown away the compression and the query locality that streams exist
+to give you in the first place.
+
+## The map: where that line ends up
+
+Now zoom out. That stream doesn't float free — it lives in a nested structure worth having in
+your head before any of the later chapters. And there's less of it than you'd expect: there is
+**one binary**. "Single-node", "insert", and "select" aren't separate programs — they're the
+same executable behaving differently based on flags. We'll stay on the single-node path, where
+the whole engine is one Go package.
+
+Inside it, the containment goes three levels deep. A
+<Annotate client:visible type="underline">Storage</Annotate> owns a list of **partitions, one
+per day** (a line's `_time` is what sorts it into its day). And here's the fact to carry
+through the rest of the series: each partition keeps **two completely independent LSM trees** —
+one for the log *data*, one for the stream *index*.
+
+<Figure caption="One binary. A Storage of per-day partitions. Each partition keeps two separate LSM trees — datadb (the columnar log data) and indexdb (the stream index). Blurring these two is the fastest way to be wrong about VictoriaLogs.">
+  <ContainmentTree client:visible />
+</Figure>
+
+The <span class="ink-teal">datadb</span> is where the actual log fields live, stored by column
+(that's chapters of its own: parts, blocks, and columns). The
+<span class="ink-accent">indexdb</span> is a different tree entirely — it answers "which
+streams carry the tag `app="api"`?" so a query can find streams without scanning them. Two
+trees, two background mergers, two jobs. It's worth keeping them separate in your head from day
+one — a lot of confusion later comes from quietly blurring the two.
+
+## Do it yourself: from a log line to bytes on disk
+
+Everything above you can watch happen on your own machine in about five minutes — no Docker, no
+config, nothing to sign up for. It's worth following along; there's something clarifying about
+seeing the data model stop being a diagram and turn into real files you can `ls`.
+
+### 1 · Get VictoriaLogs
+
+Make a scratch directory, then find out which build you need — the archive must match your OS
+**and** CPU architecture:
+
+```sh
+mkdir vl-quick-start && cd vl-quick-start
+uname -sm        # your OS + arch, e.g. "Darwin arm64" or "Linux x86_64"
+```
+
+Map that to the archive name on the
+[releases page](https://github.com/VictoriaMetrics/VictoriaLogs/releases/latest) —
+`victoria-logs-<os>-<arch>-<version>.tar.gz`:
+
+<Table
+  headers={['<code>uname -sm</code>', 'Archive']}
+  rows={[
+    ['Darwin arm64', '<code>victoria-logs-darwin-arm64-…</code> &nbsp;(Apple Silicon: M1/M2/M3/M4)'],
+    ['Darwin x86_64', '<code>victoria-logs-darwin-amd64-…</code> &nbsp;(Intel Mac)'],
+    ['Linux x86_64', '<code>victoria-logs-linux-amd64-…</code>'],
+    ['Linux aarch64', '<code>victoria-logs-linux-arm64-…</code>'],
+  ]}
+/>
+
+For example, on an Apple-Silicon Mac:
+
+```sh
+curl -L -O https://github.com/VictoriaMetrics/VictoriaLogs/releases/download/v1.52.0/victoria-logs-darwin-arm64-v1.52.0.tar.gz
+tar xzf victoria-logs-darwin-arm64-v1.52.0.tar.gz    # unpacks a single `victoria-logs-prod`
+```
+
+<MarginNote>
+  <b>`zsh: exec format error`?</b> That's the wrong-architecture archive — the single most common
+  slip here. Re-download the one that matches your <code>uname -sm</code>. (On macOS, a
+  <em>different</em> message about an unverified developer is Gatekeeper; clear it with
+  <code>xattr -d com.apple.quarantine ./victoria-logs-prod</code>.)
+  <br/><br/>
+  Prefer containers? <code>docker run --rm -p 9428:9428 docker.io/victoriametrics/victoria-logs:latest</code>
+  does the same thing, no arch-matching needed. Working from source? <code>go&nbsp;build&nbsp;./app/victoria-logs</code>
+  builds the identical files — the on-disk format doesn't care how you got the binary.
+</MarginNote>
+
+### 2 · Start it
+
+Just run it — no arguments needed:
+
+```sh
+./victoria-logs-prod
+```
+
+It listens on port **9428** and creates a `victoria-logs-data/` directory next to the binary —
+that's where everything we're about to inspect will land. Leave it running and open a second
+terminal for the next steps.
+
+### 3 · Ingest five log lines
+
+Put these five lines in `sample.jsonl`. They're designed to prove the stream rules: the first
+three share `app=api, pod=api-7` but differ in message — and line 3 even lists the fields in a
+different order and carries an empty `region`. The last two change `pod`, then `app`:
+
+```json
+{"_time":"2026-10-31T10:00:01Z","app":"api","pod":"api-7","level":"info","trace_id":"t-aaa","_msg":"user logged in"}
+{"_time":"2026-10-31T10:00:02Z","app":"api","pod":"api-7","level":"error","trace_id":"t-bbb","_msg":"db timeout after 3s"}
+{"_time":"2026-10-31T10:00:03Z","pod":"api-7","app":"api","region":"","_msg":"field order and empty region do not change the stream"}
+{"_time":"2026-10-31T10:00:04Z","app":"api","pod":"api-9","_msg":"different pod = different stream"}
+{"_time":"2026-10-31T10:00:05Z","app":"worker","pod":"w-2","_msg":"different app = different stream"}
+```
+
+Send them to the [jsonline endpoint](https://docs.victoriametrics.com/victorialogs/data-ingestion/),
+naming `app` and `pod` as the stream fields:
+
+```sh
+curl -X POST -H 'Content-Type: application/stream+json' --data-binary @sample.jsonl \
+  'http://localhost:9428/insert/jsonline?_stream_fields=app,pod'
+```
+
+The `Content-Type` header matters — without it the body is read as a web form and nothing is
+stored. A `200` with an empty body means success.
+
+### 4 · Query them back
+
+Ask the server for each line's **derived** `_stream` and `_stream_id` (the `query` is
+[LogsQL](https://docs.victoriametrics.com/victorialogs/logsql/); `_time:1d` just means "the last
+day"):
+
+```sh
+curl http://localhost:9428/select/logsql/query \
+  -d 'query=_time:1d | sort by (_time) | keep _stream, _stream_id, _msg'
+```
+
+```text
+{app="api",pod="api-7"}    0000000000000000f9857ac5ce08a117958ea2f865a13e65   user logged in
+{app="api",pod="api-7"}    0000000000000000f9857ac5ce08a117958ea2f865a13e65   db timeout after 3s
+{app="api",pod="api-7"}    0000000000000000f9857ac5ce08a117958ea2f865a13e65   field order and empty region do not change the stream
+{app="api",pod="api-9"}    0000000000000000311d0b67ca7c3f9d942fbbf2440e9470   different pod = different stream
+{app="worker",pod="w-2"}   00000000000000005bf978436a7c2bfaac1faf4208696354   different app = different stream
+```
+
+There it is: the first three lines collapse to **one** `_stream_id` despite different messages,
+reordered fields, and that empty `region`. Change a stream field and the id changes. And the
+id's shape is exactly `tenant + hash` — the leading
+<span class="ink-accent">0000000000000000</span> is tenant `(0,0)`; the rest is the 128-bit
+hash of the sorted tags. Count the distinct streams and you get **3**, not 5:
+
+```sh
+curl http://localhost:9428/select/logsql/query -d 'query=_time:1d | count_uniq(_stream_id)'
+# {"count_uniq(_stream_id)":"3"}
+```
+
+(Prefer clicking? The same data is browsable in the built-in Web UI at
+[`/select/vmui`](http://localhost:9428/select/vmui).)
+
+### 5 · Watch the files appear
+
+In-memory data is flushed to disk every few seconds (`-inmemoryDataFlushInterval`, default
+**5s**). Wait a moment, then list the data directory — and the containment map from earlier
+draws itself in real directories:
+
+```text
+victoria-logs-data/
+└── partitions/
+    └── 20261031/                    ← one partition — today (YYYYMMDD)
+        ├── datadb/                  ← LSM tree #1: the log DATA
+        │   ├── parts.json           ← the list of live parts
+        │   └── 18E396AD68651529/    ← a "part": an immutable directory
+        └── indexdb/                 ← LSM tree #2: the stream INDEX
+            ├── parts.json
+            └── 18E396AD6862BF81/    ← a part, but a different shape (see below)
+```
+
+The per-day partition, and inside it the **two independent LSM trees** — not a diagram now, but
+folders you can `cd` into.
+
+### 6 · Anatomy of a part
+
+List that `datadb` part directory and you get a dozen small files (sizes from this exact run):
+
+```text
+   200  metadata.json              53  metaindex.bin
+   133  index.bin                   5  timestamps.bin
+    44  column_names.bin           27  values.bin0
+   259  columns_header.bin          0  bloom.bin0
+    37  columns_header_index.bin    9  message_values.bin
+     7  column_idxs.bin             0  message_bloom.bin
+```
+
+They look cryptic, but they fall into four jobs:
+
+<Figure caption="The files in one datadb part, grouped by what they do. The _msg field gets its own value and bloom files — because internally it's the empty-name column. We open these byte-by-byte in later chapters.">
+  <PartAnatomy client:visible />
+</Figure>
+
+Start with `metadata.json` — the part's summary:
+
+```json
+{ "FormatVersion": 3, "RowsCount": 5, "BlocksCount": 3,
+  "CompressedSizeBytes": 574, "UncompressedSizeBytes": 729, "BloomValuesShardsCount": 1 }
+```
+
+**Three blocks for five rows.** That's the data model showing through: rows are sorted by
+`(stream, time)` and a block is cut at every stream change, so our three streams become three
+blocks — one block never mixes two streams.
+
+<Figure caption="Why five rows became three blocks: one block per stream. Inside a block, the fields are stored column by column — the subject of a later chapter.">
+  <RowsToBlocks client:visible />
+</Figure>
+
+Two details worth noticing now, both of which pay off later:
+
+- `message_values.bin` and `message_bloom.bin` exist as *separate files*. `_msg` really is
+  stored apart from every other field — the empty-name column, as promised.
+- `"FormatVersion": 3`, and files like `columns_header_index.bin` and `column_idxs.bin` exist.
+  Those are the **wide-events refactor** — a real redesign we'll devote a whole chapter to.
+
+Finally, glance at the *other* tree. The `indexdb` part has a completely different file set —
+`items.bin`, `lens.bin` — because it's a generic sorted key→value store (a "mergeset"), not
+columnar at all. Its `metadata.json` counts *items*, not rows:
+
+```json
+{ "ItemsCount": 11, "BlocksCount": 1,
+  "FirstItem": "000000000000000000311d0b67ca7c3f9d942fbbf2440e9470", … }
+```
+
+Look closely at that `FirstItem`: buried in the hex is `311d0b67…` — the same stream-id hash we
+saw for `pod=api-9` up in step 4. The index literally stores the streams, so a `{app="api"}`
+query can find them without touching `datadb`. Two trees, two jobs, two formats — exactly the
+map we drew. Cracking open those `.bin` files is what the rest of the series is for.
+
+## What you now know
+
+<ol class="steps">
+  <li>A log entry is a <b>flat bag of string→string fields</b>; nested JSON is flattened, every value is stringified, and empty equals missing.</li>
+  <li>Four fields are special: <span class="ink-accent">_msg</span> (stored under the empty name), <span class="ink-accent">_time</span> (which picks the day-partition), and the derived <span class="ink-accent">_stream</span> / <span class="ink-accent">_stream_id</span>.</li>
+  <li>A <b>stream</b> is <code>tenant + hash128</code> of the <b>chosen stream fields only</b>, in sorted order — so messages, field order, and empty values never change it.</li>
+  <li>Choosing stream fields is your biggest lever: good ones group an instance together; a <span class="ink-red">high-cardinality</span> one shatters storage into a stream per line.</li>
+  <li>The shape on disk: one binary → a <b>Storage</b> of per-day <b>partitions</b> → <b>two independent LSM trees</b> each (<span class="ink-teal">datadb</span> for data, <span class="ink-accent">indexdb</span> for the stream index).</li>
+</ol>
+
+So one line becomes a field bag, a chosen handful of those fields hashes it into a stream, and
+that stream lands in a per-day partition split across two trees. Next we follow that line the
+rest of the way in — from an HTTP request to sorted, immutable bytes inside `datadb` — and watch
+the first naive design hit its first wall.

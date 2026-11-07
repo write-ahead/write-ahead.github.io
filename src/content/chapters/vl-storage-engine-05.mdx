@@ -1,0 +1,10 @@
+---
+title: "VictoriaLogs storage internals: Full-text search without scanning"
+description: A full-text query that reads every block is a non-starter at terabyte scale. We read the tokenizer and the per-block bloom filters that let a query skip the blocks it cannot possibly match — search as a process of elimination, not a scan.
+pubDate: 2026-12-01
+order: 5
+part: Log storage
+path: victorialogs/internals/storage-engine/full-text-search
+tags: ['log storage', 'victorialogs', 'full-text', 'bloom filter']
+status: soon
+---

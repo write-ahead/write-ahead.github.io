@@ -1,6 +1,6 @@
 ---
 import BaseLayout from '../../layouts/BaseLayout.astro';
-import { getAllTags, type TagGroup } from '../../utils/chapters';
+import { getAllTags, chapterHref, type TagGroup } from '../../utils/chapters';
 
 export async function getStaticPaths() {
   const tags = await getAllTags();
@@ -18,18 +18,18 @@ const fmt = (d: Date) =>
   new Date(d).toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' });
 ---
 
-<BaseLayout title={`#${tag.label}`} description={`Chapters about ${tag.label}.`}>
+<BaseLayout title={`#${tag.label}`} description={`Entries about ${tag.label}.`}>
   <a class="back-link" href="/tags/">← all topics</a>
   <div class="eyebrow" style="margin-top:14px;">topic</div>
   <h1>#{tag.label}</h1>
   <p class="lede">
-    {tag.chapters.length} chapter{tag.chapters.length === 1 ? '' : 's'} about “{tag.label}”.
+    {tag.chapters.length} entr{tag.chapters.length === 1 ? 'y' : 'ies'} about “{tag.label}”.
   </p>
 
   <ul class="post-list">
     {tag.chapters.map((ch) => (
       <li class="post-card" data-sketch-frame>
-        <a class="card-title" href={`/chapters/${ch.id}`}>{ch.data.title}</a>
+        <a class="card-title" href={chapterHref(ch)}>{ch.data.title}</a>
         <div class="meta">{fmt(ch.data.pubDate)}</div>
         <p>{ch.data.description}</p>
       </li>

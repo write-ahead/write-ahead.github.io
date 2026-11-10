@@ -39,7 +39,11 @@ const ogImageURL = new URL(image ?? '/og-default.png', Astro.site);
         } catch (e) {}
       })();
     </script>
+    {/* Favicons: SVG for modern browsers, PNG rasters for Google Search + older clients */}
     <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <link rel="icon" type="image/png" sizes="96x96" href="/favicon-96x96.png" />
+    <link rel="icon" type="image/png" sizes="48x48" href="/favicon-48x48.png" />
+    <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
     <title>{title}</title>
     <meta name="description" content={description} />
     <link rel="canonical" href={canonicalURL} />

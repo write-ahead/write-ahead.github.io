@@ -49,11 +49,11 @@
 html, body { margin: 0; padding: 0; }
 body {
   background-color: var(--bg);
-  /* square page-grid: faint cells, like slots on a database page */
+  /* engineering dot-grid: a faint dot at each cell corner, like an
+     engineering pad — quiet enough to sit behind running text */
   background-image:
-    linear-gradient(to right, var(--line) 1px, transparent 1px),
-    linear-gradient(to bottom, var(--line) 1px, transparent 1px);
-  background-size: 26px 26px;
+    radial-gradient(var(--line) 1.4px, transparent 1.6px);
+  background-size: 22px 22px;
   background-position: -1px -1px;
   color: var(--ink);
   font-family: var(--font-body);
@@ -476,6 +476,7 @@ table.ledger a { color: var(--accent); }
   padding: max(10vh, env(safe-area-inset-top, 0px)) 16px 16px;
   backdrop-filter: blur(2px);
 }
+.search-overlay[hidden] { display: none; }
 .search-modal {
   width: 100%; max-width: 560px; background: var(--bg);
   border: 2px dashed var(--accent); border-radius: 14px;

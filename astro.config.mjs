@@ -3,6 +3,7 @@ import { defineConfig } from 'astro/config';
 import react from '@astrojs/react';
 import mdx from '@astrojs/mdx';
 import pagefind from 'astro-pagefind';
+import sitemap from '@astrojs/sitemap';
 
 // Pagefind indexes the built HTML after every `astro build` and serves the
 // prebuilt index during `astro dev`. It must run last so it sees the final
@@ -10,5 +11,5 @@ import pagefind from 'astro-pagefind';
 // https://astro.build/config
 export default defineConfig({
   site: 'https://write-ahead.github.io',
-  integrations: [react(), mdx(), pagefind()],
+  integrations: [react(), mdx(), sitemap(), pagefind()],
 });

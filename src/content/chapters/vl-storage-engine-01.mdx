@@ -1,12 +1,12 @@
 ---
-title: "VictoriaLogs storage internals: How the logs get in"
-description: The opening post of the series. We draw the map — the flat data model, the stream (a hash of the fields you choose, not a property of the log line), and the two LSM trees per day — then watch it all land on disk, file by file.
+title: "#1 VictoriaLogs storage internals: How the logs get in"
+description: How a log line gets in. We build the laziest log store that still works, feel exactly where it breaks, then follow one line through VictoriaLogs' front door — parsed into typed fields, stamped with the stream it belongs to, laid into a column-friendly shape — right up to the moment it crosses the seam into storage.
 pubDate: 2026-11-10
 order: 1
 part: Log storage
 path: victorialogs/internals/storage-engine/how-line-gets-in
 tags: ['log storage', 'victorialogs', 'data model']
-status: soon
+status: posted
 ---
 
 import StreamBuilder from '../../components/StreamBuilder.tsx';
@@ -18,20 +18,19 @@ import VersusCard from '../../components/VersusCard.astro';
 import Table from '../../components/Table.astro';
 import Figure from '../../components/Figure.astro';
 import MarginNote from '../../components/MarginNote.astro';
+import CodeRef from '../../components/CodeRef.astro';
 
-### Naive log storage 
+Every log storage engine is a wager about where to pay. Writes are relentless and dull — gigabytes an hour, each line worth almost nothing on its own. Reads are rare but desperate: it's 3 a.m., something is on fire, and someone needs *this* error, from *this* service, in the last five minutes, now. You can spend the cost of that bet at write time or at read time, but you cannot escape it. Where you choose to pay decides everything else about the system you end up with.
 
-lets imagine a naive log storage , we will call it naive-log 
+The honest way to feel that choice is to make the laziest one possible and watch it break. So that's where we'll start: we'll build the simplest log store that still genuinely works, use it, and let it fail on its own terms. Everything VictoriaLogs does afterward will read not as cleverness for its own sake, but as a considered answer to a failure we felt with our own hands.
 
-the naive-log would not be a strawamn, otherwise every solution the real victoria log gives for 
-the naive-log problem would feel manufactured.
+## The laziest store that works
 
-the naive-log would be something which could exist in real life as well as a solution for tiny scale logging.
-This way we would really get to know the limitation of naive-log storage and how victoria logs solves it.
+Call it **naive-log**. One rule governs it: it must not be a strawman. If it were, every move VictoriaLogs makes later would feel staged — a magician palming the card he's about to "discover." naive-log has to be something you'd actually reach for at small scale, something whose appeal is real. Only then is its breaking point real too.
 
-consider the following code for the naive-log
+Here it is, in full — small enough to hold in your head:
 
-//Todo-claude= put following code snippet in the code block
+
 
 ```go
 // Append: O(1) amortized. Just bytes on the end of a file.
@@ -70,11 +69,8 @@ func Scan(path string, min, max time.Time, match map[string]string) ([]map[strin
 ```
 
 
-the log comes in and is simply appended to the storage file on the disk.
+A line comes in; we append it to the end of a file on disk. That is the entire write side. There is no index, no sort, no bookkeeping — which means that when a question arrives, there is also no shortcut. To answer anything at all, we have to read the whole file, because nothing in it offers a sublinear path to what we're looking for.
 
-and when we need to query for anything we need to scan the whole file because there is no index which could provide a sublinear path to the thing being searched for 
-
-//Todo-claude= put a good illustration here showing the working of naive-log storage in detail 
 
 <Figure caption="naive-log is one flat file. Every source appends its JSON line to the end (O(1), no coordination), so lines land in arrival order — which is only roughly time-ordered (note the late 09:02 at the bottom). There is no index of any kind, so every read has to march through all N lines.">
   <svg viewBox="0 0 720 300" role="img" aria-label="Naive append-only log file" style="width:100%;height:auto">
@@ -117,9 +113,10 @@ and when we need to query for anything we need to scan the whole file because th
   </svg>
 </Figure>
 
-### Naive-log write path - why its seductive 
-incoming log -> encode JSON -> write bytes + '\n' to the end of the file
-//Todo-claude= explain the above with illustration 
+### Why the lazy choice is so tempting
+
+Look at the write path and you'll understand why anyone would build this on purpose: an incoming log becomes JSON, and those bytes plus a newline go on the end of the file. That's all.
+
 
 <Figure caption="The entire write path: take the incoming fields, encode them to JSON, append the bytes plus a newline to the end of the file. Three steps, no bookkeeping — this is why appending feels free. The whole cost of that simplicity is pushed to read time.">
   <svg viewBox="0 0 720 150" role="img" aria-label="Naive-log write path" style="width:100%;height:auto">
@@ -147,11 +144,11 @@ incoming log -> encode JSON -> write bytes + '\n' to the end of the file
   </svg>
 </Figure>
 
-this is the whole appeal.Writing is trivial and fast. All the cost has been deferred to read time — and that deferred bill is the entire series.
+That is the whole seduction. Writing is trivial, fast, and free of coordination — three steps and no thinking. But nothing is actually free; the cost didn't vanish, it moved. Every bit of work we skipped at write time is now waiting at read time, with interest. That deferred bill is, quite literally, the rest of this series.
 
-### Naive-log query path - where is collapses 
-Ask: svc=api AND level=error, time ∈ [09:00, 09:05].
-//Todo-claude= add the illustration to show how this query would be satisfied in the naive-log 
+### Where the bill comes due
+
+Now send the kind of question people actually ask: *give me `svc=api` and `level=error` between 09:00 and 09:05.* Watch what the store has to do to answer it.
 
 <Figure caption="The query svc=api AND level=error in [09:00,09:05] touches every line: the cursor cannot skip (no order), it fully parses each line to read any field, and it compares only after parsing. Two lines match — but the work was the whole file. The answer is tiny; the cost is O(N).">
   <svg viewBox="0 0 720 330" role="img" aria-label="Naive-log query path full scan" style="width:100%;height:auto">
@@ -193,11 +190,12 @@ Ask: svc=api AND level=error, time ∈ [09:00, 09:05].
   </svg>
 </Figure>
 
-The store gets slower forever, no matter how small the answer.
-### Zoom into once log - the hidden tax 
-Even testing a single field is expensive, because the data is row-oriented and opaque:
+Two lines match. To find them, we read all of them. And this is the cruel part: the cost has nothing to do with the size of the answer and everything to do with the size of the history. A one-row result in a billion-row file still reads a billion rows. The store doesn't get slow under load — it gets slower *forever*, a little more with every line ever written.
 
-//Todo-claude= put the illustration here to explain this point in naive-log 
+### The tax hiding inside a single line
+
+It's tempting to think the problem is just "too many lines." But the waste goes deeper than that: even reading *one* field out of *one* line is expensive, because of how the line is stored.
+
 
 <Figure caption="One line, stored row-oriented as opaque JSON. The query only needs `level`, but the fields are glued together in one blob — so to reach `level` the parser must walk and decode every field before it (and every field after, to know where the line ends). You pay for the whole row to read one column.">
   <svg viewBox="0 0 720 200" role="img" aria-label="Row-oriented parse tax for one log line" style="width:100%;height:auto">
@@ -227,11 +225,18 @@ Even testing a single field is expensive, because the data is row-oriented and o
   </svg>
 </Figure>
 
-You pay for every field on every line, even the ones the query never mentions.
+So the tax compounds in two directions at once. Across the file you pay for every line, even the ones that don't match. Within each line you pay for every field, even the ones the query never mentions. A filter on `level` drags the entire row — timestamps, trace IDs, request paths, message bodies — through the parser just to glance at one word.
 
 
 
-//Todo-claude= put the illustrations to explain the following limitations
+
+
+## Why it's doomed
+
+### Six walls
+
+The slowness isn't a bug we could patch. It falls out of six structural choices baked into "just append JSON to a file" — and each one is a wall the rest of this series spends its time climbing. It's worth naming them precisely, because every later move VictoriaLogs makes is aimed squarely at one of these.
+
 <Figure caption="The six structural limitations of naive-log, each one a wall the rest of the series climbs. Every later move VictoriaLogs makes — sorting, per-stream grouping, columnar blocks, bloom filters, immutable parts, dictionary encoding — exists to knock out one of these panels.">
   <svg viewBox="0 0 720 244" role="img" aria-label="Six limitations of naive-log" style="width:100%;height:auto">
     <defs><filter id="rl5" x="-3%" y="-6%" width="106%" height="112%"><feTurbulence type="fractalNoise" baseFrequency="0.012" numOctaves="2" seed="9" result="n"/><feDisplacementMap in="SourceGraphic" in2="n" scale="1.5"/></filter></defs>
@@ -276,91 +281,167 @@ You pay for every field on every line, even the ones the query never mentions.
   </svg>
 </Figure>
 
-### Limitation of naive-log 
+**1 · No ordering.** Lines sit in the file in whatever order they happened to arrive, which is nobody's idea of sorted. A matching row could be anywhere, so there's no binary search to reach for, no range to seek to — only the march from the top.
 
-Lets address the limitations of naive-log 
+**2 · No grouping.** The file knows nothing about which lines belong together. "All the logs from the `api` service" isn't a place you can jump to; it's a verdict you reach one line at a time, after testing every line in the file.
 
-#### 1. No ordering 
-when queried for some logs the matches could be anywhere in the file, no sorting no ordering, so not even binary search could be done.
+**3 · Row-oriented.** Each line is one glued-together blob. To read a single field you must parse the whole row — every field before it to find it, every field after it to know where the line ends.
 
-#### 2. No grouping 
-every line tested individually, no "these belong to streamx" kind of grouping 
+**4 · No value index.** Even if you've reached the right field, there's no index over its *values*. A search for an error code or a trace ID reads every value in the file; the data can't tell you where its own contents live.
 
-#### 3. Row oriented 
-must parse all fields of every line to read one 
+**5 · Unbounded growth.** Append-only cuts both ways. You can't punch a hole in the middle of a file, so deleting old data means rewriting the whole thing. Retention by age — the one thing every logging system needs — is impossible without copying everything you're keeping.
 
-#### 4. No value index within a field
-even per column, token/substring search reads all the values 
+**6 · No compression that survives reads.** Logs are wildly repetitive and should compress beautifully. But plain JSONL only compresses generically, and gzipping the whole file destroys random access: to read line N you have to decompress from byte zero. Compression and seekability are at war, and naive-log loses both.
 
-### 5. Unbounded Growth
-Append only means deleting old data = rewriting the whole fil( you can't punch a hole in the middle). Retention by age is impossible without a full rewrite.
+### What logs are actually like
 
-#### 6. No compression 
-Logs are wildly repetitive, but opaque JSONL only compresses generically and gzipping the file destroys random access to read line N you decompress from the start).
+Before we can judge any fix, we need to know the material we're working with. naive-log fails not just because it's lazy, but because it ignores everything particular about *logs* — and logs are a peculiar kind of data. A good log engine isn't built in spite of these quirks; it's built to exploit every one of them. Hold these six next to the six walls above: each wall is one of these properties left unused, and every design choice still ahead is one of them finally turned to advantage.
 
-### What are we going to do in this blog entry 
-we are not going to see how VictoriaLogs addresses the problems of naive-log. The first step would be 
-what the log row is and where does it belong.
+<Figure caption="The six properties of a log workload — the raw material every good log store is built around. Append-only writes, torrential volume with cheap rows, near-time-ordering, heavy repetition, a narrow query shape, and short retention. Hold these next to the six limitations of naive-log: each limitation is one of these levers left unused, and every VictoriaLogs design choice ahead is one of them finally pulled.">
+  <svg viewBox="0 0 720 244" role="img" aria-label="Six properties of a log workload" style="width:100%;height:auto">
+    <defs><filter id="rlp" x="-3%" y="-6%" width="106%" height="112%"><feTurbulence type="fractalNoise" baseFrequency="0.012" numOctaves="2" seed="14" result="n"/><feDisplacementMap in="SourceGraphic" in2="n" scale="1.5"/></filter></defs>
+    <g filter="url(#rlp)">
+      <rect x="20" y="16" width="220" height="100" rx="10" style="fill:var(--panel);stroke:var(--line);stroke-width:1.5"/>
+      <rect x="260" y="16" width="220" height="100" rx="10" style="fill:var(--panel);stroke:var(--line);stroke-width:1.5"/>
+      <rect x="500" y="16" width="220" height="100" rx="10" style="fill:var(--panel);stroke:var(--line);stroke-width:1.5"/>
+      <rect x="20" y="128" width="220" height="100" rx="10" style="fill:var(--panel);stroke:var(--line);stroke-width:1.5"/>
+      <rect x="260" y="128" width="220" height="100" rx="10" style="fill:var(--panel);stroke:var(--line);stroke-width:1.5"/>
+      <rect x="500" y="128" width="220" height="100" rx="10" style="fill:var(--panel);stroke:var(--line);stroke-width:1.5"/>
+      <circle cx="46" cy="42" r="13" style="fill:var(--accent2);stroke:none"/>
+      <circle cx="286" cy="42" r="13" style="fill:var(--accent2);stroke:none"/>
+      <circle cx="526" cy="42" r="13" style="fill:var(--accent2);stroke:none"/>
+      <circle cx="46" cy="154" r="13" style="fill:var(--accent2);stroke:none"/>
+      <circle cx="286" cy="154" r="13" style="fill:var(--accent2);stroke:none"/>
+      <circle cx="526" cy="154" r="13" style="fill:var(--accent2);stroke:none"/>
+      <line x1="192" y1="40" x2="216" y2="40" style="stroke:var(--accent2);stroke-width:1.5"/>
+      <line x1="192" y1="46" x2="216" y2="46" style="stroke:var(--accent2);stroke-width:1.5"/>
+      <line x1="192" y1="52" x2="216" y2="52" style="stroke:var(--accent2);stroke-width:1.5"/>
+      <line x1="204" y1="24" x2="204" y2="34" style="stroke:var(--accent2);stroke-width:1.5"/>
+      <line x1="199" y1="29" x2="209" y2="29" style="stroke:var(--accent2);stroke-width:1.5"/>
+      <rect x="432" y="48" width="7" height="8" style="fill:color-mix(in srgb,var(--accent2) 30%,var(--panel));stroke:var(--accent2);stroke-width:1.2"/>
+      <rect x="442" y="40" width="7" height="16" style="fill:color-mix(in srgb,var(--accent2) 30%,var(--panel));stroke:var(--accent2);stroke-width:1.2"/>
+      <rect x="452" y="30" width="7" height="26" style="fill:color-mix(in srgb,var(--accent2) 30%,var(--panel));stroke:var(--accent2);stroke-width:1.2"/>
+      <circle cx="690" cy="42" r="12" style="fill:none;stroke:var(--accent2);stroke-width:1.5"/>
+      <line x1="690" y1="42" x2="690" y2="33" style="stroke:var(--accent2);stroke-width:1.5"/>
+      <line x1="690" y1="42" x2="697" y2="45" style="stroke:var(--accent2);stroke-width:1.5"/>
+      <rect x="190" y="150" width="8" height="8" style="fill:none;stroke:var(--accent2);stroke-width:1.3"/>
+      <rect x="201" y="150" width="8" height="8" style="fill:none;stroke:var(--accent2);stroke-width:1.3"/>
+      <rect x="212" y="150" width="8" height="8" style="fill:none;stroke:var(--accent2);stroke-width:1.3"/>
+      <circle cx="448" cy="150" r="8" style="fill:none;stroke:var(--accent2);stroke-width:1.5"/>
+      <line x1="454" y1="156" x2="462" y2="164" style="stroke:var(--accent2);stroke-width:1.6"/>
+      <line x1="684" y1="150" x2="706" y2="150" style="stroke:var(--accent2);stroke-width:1.5"/>
+      <line x1="690" y1="146" x2="700" y2="146" style="stroke:var(--accent2);stroke-width:1.5"/>
+      <rect x="687" y="150" width="16" height="15" style="fill:none;stroke:var(--accent2);stroke-width:1.3"/>
+    </g>
+    <text x="46" y="47" text-anchor="middle" style="fill:var(--panel);font-family:var(--font-hand);font-size:14px;font-weight:700">1</text>
+    <text x="286" y="47" text-anchor="middle" style="fill:var(--panel);font-family:var(--font-hand);font-size:14px;font-weight:700">2</text>
+    <text x="526" y="47" text-anchor="middle" style="fill:var(--panel);font-family:var(--font-hand);font-size:14px;font-weight:700">3</text>
+    <text x="46" y="159" text-anchor="middle" style="fill:var(--panel);font-family:var(--font-hand);font-size:14px;font-weight:700">4</text>
+    <text x="286" y="159" text-anchor="middle" style="fill:var(--panel);font-family:var(--font-hand);font-size:14px;font-weight:700">5</text>
+    <text x="526" y="159" text-anchor="middle" style="fill:var(--panel);font-family:var(--font-hand);font-size:14px;font-weight:700">6</text>
+    <text x="70" y="47" style="fill:var(--ink);font-family:var(--font-hand);font-size:15px;font-weight:700">Append-only</text>
+    <text x="38" y="78" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:11px">write once, then</text>
+    <text x="38" y="96" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:11px">query — no updates</text>
+    <text x="310" y="47" style="fill:var(--ink);font-family:var(--font-hand);font-size:15px;font-weight:700">Huge volume</text>
+    <text x="278" y="78" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:11px">GB–TB per day;</text>
+    <text x="278" y="96" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:11px">each row low-value</text>
+    <text x="550" y="47" style="fill:var(--ink);font-family:var(--font-hand);font-size:15px;font-weight:700">Near-ordered</text>
+    <text x="518" y="78" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:11px">arrives ~sorted,</text>
+    <text x="518" y="96" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:11px">never exactly</text>
+    <text x="70" y="159" style="fill:var(--ink);font-family:var(--font-hand);font-size:15px;font-weight:700">Repetitive</text>
+    <text x="38" y="190" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:11px">level, svc, host,</text>
+    <text x="38" y="208" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:11px">k8s labels repeat</text>
+    <text x="310" y="159" style="fill:var(--ink);font-family:var(--font-hand);font-size:15px;font-weight:700">Narrow queries</text>
+    <text x="278" y="190" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:11px">time + a few filters</text>
+    <text x="278" y="208" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:11px">+ free-text search</text>
+    <text x="550" y="159" style="fill:var(--ink);font-family:var(--font-hand);font-size:15px;font-weight:700">Short retention</text>
+    <text x="518" y="190" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:11px">aged out quickly;</text>
+    <text x="518" y="208" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:11px">no long horizons</text>
+  </svg>
+</Figure>
 
-we can't start building optimizations like index and others over simple append only log.
-So the first real move isn't an index, its imposing structure at the front door.
+**1 · Write-once.** A log line is never updated in place. It is written once and from then on only read. A storage engine that never has to modify a row in the middle of a file is free to do things a general-purpose database cannot — most of all, to treat its files as immutable.
 
-At ingest time VictoriaLogs parses the log into typed fields, separates the fields that identify the source ( the stream fields), computes a streamID from them,
-and buffers the row in the column friendly shape.
+**2 · Torrential, but cheap.** Logs arrive by the gigabyte or terabyte a day, yet any single row is worth almost nothing. That ratio rules out any design that spends real money *per row* — a precise index on every field, say — because you'd pay a fortune to catalogue data you'll likely never look at.
 
-This is the honest framing of this post: before you can be fast, you have to decide what you're storing. The naive store answers this question as "a line of text"; VictoriaLogs answers "a typed row that already knows its stream."
-Every later rung — sorting, columns, bloom, the inverted index — is only possible because that decision was made at the door.
+**3 · Nearly ordered, never exactly.** When a line shows up at the ingest endpoint, its `_time` is usually close to now, and usually later than the line before it. But *usually* is not *always* — clocks skew, buffers flush late, a batch arrives out of order. The whole gap between "usually" and "always" is where real design decisions get made; an engine that assumed perfect order would corrupt itself on the first late arrival.
 
-### Properties of a log workload 
-it would be beneficial to discuss the properties of the log workload at this point.
+**4 · Drowning in repetition.** Look at a thousand consecutive log lines and you'll see the same `level`, the same `service`, the same `host`, the same Kubernetes labels, over and over. The information is in what *changes*; the rest is near-constant. An engine that stores those repeats naively is paying again and again for a value it already knows.
 
-because every good log storage engine would exploit these properties 
+**5 · Narrow, predictable questions.** For all their volume, logs get asked a surprisingly narrow set of questions: a time range, a few field filters, and some free-text search. You almost never join logs or aggregate across all of history. That narrowness is a gift — you can optimize hard for the shape of query that actually shows up.
 
-#### 1. Write pattern
-the first property is this that logs are by nature appendonly, they are not updated in place, just write-once and then query.
+**6 · Short-lived.** Unlike the records in a business database, logs age out fast — days or weeks, not years. The engine doesn't need to keep data forever; it needs to *drop* it cheaply and constantly, which pulls retention and deletion to the center of the design instead of the margins.
 
-#### 2. Volume 
-They have an enormous volume (GB/TB per day), each row is individually cheap/low value.
+### The four fixes you're already shouting
 
-#### 3. Time 
-Logs roughly arrive in the time order, but you can never assume exactly.
-when a log line shows up at the ingestion endpoint, its _time is usually close to "now" and usually later than the line before it.
-But "usually" is not "always," and the gap between those two words is what forces a real design decision.
+If you've read this far, you're probably arguing with the screen — *just do X, obviously.* Good. There are four obvious fixes, and a careful reader thinks of all of them. The interesting thing is that none of them is simply wrong; each is half-right, and the exact way each one fails is the motivation for a specific thing VictoriaLogs does later. So let's take the objections seriously, one at a time.
 
-#### 4. Repetition 
-The log data is massively repetitive - level , service , host , k8s  labels repeat
+<Figure caption="The steelman. Each obvious fix a sharp reader would shout (left, crossed out) is answered by the reason it fails (right) — and that reason is the motivation for a concrete VictoriaLogs design choice. Indexing everything ignores volume; a single sort order both kills the O(1) append and still can't serve stream+field queries (hence the LSM move); one-file-per-day is real but only coarse; whole-file gzip trades away random access.">
+  <svg viewBox="0 0 720 332" role="img" aria-label="Four obvious fixes and why each fails" style="width:100%;height:auto">
+    <defs><filter id="rls" x="-3%" y="-5%" width="106%" height="110%"><feTurbulence type="fractalNoise" baseFrequency="0.012" numOctaves="2" seed="17" result="n"/><feDisplacementMap in="SourceGraphic" in2="n" scale="1.5"/></filter><marker id="ahs" markerWidth="9" markerHeight="9" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" style="fill:var(--ink-soft)"/></marker></defs>
+    <g filter="url(#rls)">
+      <rect x="16" y="30" width="270" height="62" rx="10" style="fill:var(--panel);stroke:var(--line);stroke-width:1.5"/>
+      <rect x="322" y="30" width="382" height="62" rx="10" style="fill:color-mix(in srgb,var(--rollback) 6%,var(--panel));stroke:var(--line);stroke-width:1.4"/>
+      <rect x="16" y="102" width="270" height="62" rx="10" style="fill:var(--panel);stroke:var(--line);stroke-width:1.5"/>
+      <rect x="322" y="102" width="382" height="62" rx="10" style="fill:color-mix(in srgb,var(--rollback) 6%,var(--panel));stroke:var(--line);stroke-width:1.4"/>
+      <rect x="16" y="174" width="270" height="62" rx="10" style="fill:var(--panel);stroke:var(--line);stroke-width:1.5"/>
+      <rect x="322" y="174" width="382" height="62" rx="10" style="fill:color-mix(in srgb,var(--rollback) 6%,var(--panel));stroke:var(--line);stroke-width:1.4"/>
+      <rect x="16" y="246" width="270" height="62" rx="10" style="fill:var(--panel);stroke:var(--line);stroke-width:1.5"/>
+      <rect x="322" y="246" width="382" height="62" rx="10" style="fill:color-mix(in srgb,var(--rollback) 6%,var(--panel));stroke:var(--line);stroke-width:1.4"/>
+      <circle cx="42" cy="61" r="13" style="fill:var(--rollback);stroke:none"/>
+      <circle cx="42" cy="133" r="13" style="fill:var(--rollback);stroke:none"/>
+      <circle cx="42" cy="205" r="13" style="fill:var(--rollback);stroke:none"/>
+      <circle cx="42" cy="277" r="13" style="fill:var(--rollback);stroke:none"/>
+      <line x1="286" y1="61" x2="318" y2="61" style="stroke:var(--ink-soft);stroke-width:1.7;fill:none" marker-end="url(#ahs)"/>
+      <line x1="286" y1="133" x2="318" y2="133" style="stroke:var(--ink-soft);stroke-width:1.7;fill:none" marker-end="url(#ahs)"/>
+      <line x1="286" y1="205" x2="318" y2="205" style="stroke:var(--ink-soft);stroke-width:1.7;fill:none" marker-end="url(#ahs)"/>
+      <line x1="286" y1="277" x2="318" y2="277" style="stroke:var(--ink-soft);stroke-width:1.7;fill:none" marker-end="url(#ahs)"/>
+    </g>
+    <text x="42" y="66" text-anchor="middle" style="fill:var(--panel);font-family:var(--font-hand);font-size:15px;font-weight:700">✗</text>
+    <text x="42" y="138" text-anchor="middle" style="fill:var(--panel);font-family:var(--font-hand);font-size:15px;font-weight:700">✗</text>
+    <text x="42" y="210" text-anchor="middle" style="fill:var(--panel);font-family:var(--font-hand);font-size:15px;font-weight:700">✗</text>
+    <text x="42" y="282" text-anchor="middle" style="fill:var(--panel);font-family:var(--font-hand);font-size:15px;font-weight:700">✗</text>
+    <text x="66" y="66" style="fill:var(--ink);font-family:var(--font-hand);font-size:15px;font-weight:700">Index every field</text>
+    <text x="66" y="138" style="fill:var(--ink);font-family:var(--font-hand);font-size:15px;font-weight:700">Keep it sorted by time</text>
+    <text x="66" y="210" style="fill:var(--ink);font-family:var(--font-hand);font-size:15px;font-weight:700">One file per day</text>
+    <text x="66" y="282" style="fill:var(--ink);font-family:var(--font-hand);font-size:15px;font-weight:700">Just gzip the file</text>
+    <text x="338" y="56" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:11px">Elasticsearch's move — ~30× RAM, ~15× disk.</text>
+    <text x="338" y="75" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:11px">Ignores volume: rows too many, too cheap each.</text>
+    <text x="338" y="128" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:11px">Destroys the O(1) append; one order can't serve</text>
+    <text x="338" y="147" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:11px">stream + field.  → LSM: many small sorted parts.</text>
+    <text x="338" y="200" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:11px">Half-right — that's partitioning, and VL does it.</text>
+    <text x="338" y="219" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:11px">Bounds time &amp; deletion; within a day, full scan.</text>
+    <text x="338" y="272" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:11px">Kills random access — line N ⇒ decompress from</text>
+    <text x="338" y="291" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:11px">byte 0.  Compress per block, so you read only that.</text>
+    <text x="360" y="325" text-anchor="middle" style="fill:var(--ink-soft);font-family:var(--font-hand);font-size:13px">each rejected fix is the motivation for a real VictoriaLogs design choice</text>
+  </svg>
+</Figure>
 
-#### 5. Query-shape 
-The most frequent queries include 
-time range , a few field filters  and free text search 
+**"Just index every field."** This is roughly what Elasticsearch does, and it works — at a price. Indexing everything means logs are too high-volume and too cheap-per-row to afford it: you build an expensive, precise catalogue of data that mostly never gets queried. Property 2 (torrential but cheap) says no. The bill shows up as hardware.
 
-#### 6 Retention 
-We don't need to retain the logs data for long periods of times as we do in other main stream databases.
+<VersusCard opponent="Elasticsearch" stats={[{ big: '~30×', lab: 'less RAM' }, { big: '~15×', lab: 'less disk' }]}>
+  Index <strong>everything</strong> and you pay for everything. VictoriaLogs indexes the few fields that identify a stream and leaves the rest as cheap, compressed columns — which is a large part of why it runs the same log workload on a fraction of the RAM and disk. The naive "index it all" instinct isn't free; it's just a bill paid in machines.
+</VersusCard>
 
-### The steelman — the obvious fixes, and why each fails
-A sharp reader will shout four fixes at the screen. Answer them, and each answer is the motivation for a specific VL design choice.
+**"Just keep the file sorted by time."** The moment you insist on sorted order, you destroy the O(1) append that made naive-log attractive in the first place — every insert now has to find its place. And even then, one sort order can only answer questions about *that* order; sorting by time still can't jump to "this stream's fields." VictoriaLogs' answer is the LSM move, and it's the backbone of Post 2: never re-sort one giant file. Instead, write many small, immutable, already-sorted parts and merge them in the background, so you get sorted data without ever paying to sort the whole history at once.
 
-#### 1. Just add an index on every field
-This is roughly what Elasticsearch does — and why it needs ~30× the RAM and ~15× the disk of VictoriaLogs. It ignores workload: logs are too high-volume and too cheap-per-row to afford a precise index on everything. 
+**"Just use one file per day."** This one is genuinely half-right — it's partitioning, and VictoriaLogs really does split data by time for exactly this reason. It bounds the time range a query must consider, and it makes deleting old data as cheap as dropping a file (there's wall 5 handled). But it's coarse: *within* a day you're back to a full scan. Necessary, not sufficient.
 
-#### 2. Just keep the file sorted by time 
-you destroy the O(1) append that made the naive store attractive in the first place
-And one sort order still can't serve stream + field queries. VL's answer (the LSM move): never re-sort a giant file — write many small, immutable, already-sorted parts, and merge them in the background.
+**"Just gzip the file."** Compression is the right instinct — logs are absurdly repetitive — but whole-file gzip is the wrong shape for it. It trades away random access: to read line N you must decompress from byte 0, so you've swapped one scan for another. The fix isn't *don't compress*, it's compress in *blocks*, so you decompress only the block you actually need to read. That tension — compression versus seekability — is resolved on disk in Post 4.
 
-#### 3. Just use one file per day
-Half-right — that's partitioning, and VL does exactly this for retention. But it only bounds coarse time and deletion; within a day you still full-scan. Necessary, not sufficient. 
+## The front door
 
-#### 4. Just gzip the file.
-Kills random access — to read line N you decompress from byte 0. Compression has to be per block so you decompress only what you read. 
+Those four fixes fail in four different ways, but they share one blind spot: each tries to get clever *after* the data is already lying on disk as opaque lines. That's the instinct to resist. **You cannot optimize your way out of a bad decision about what you're storing** — an index over meaningless blobs is a meticulous catalogue of the wrong thing.
 
-### VictoriaLogs ingestion 
-The entire ingest layer exists to melt ~10 different wire formats down into one neutral shape — (timestamp, []Field) — and hand it across a two-method interface. Everything protocol-specific dies at that boundary.
+So VictoriaLogs' first real move isn't an index, or a sort, or a compressor. It's <Annotate client:visible type="highlight" token="--accent2">imposing structure at the front door</Annotate> — deciding, in the instant a line arrives, what this thing *is* before it's ever written down. At ingest it parses the raw log into typed fields, picks out the few fields that say where the line came from (its *stream fields*), computes a compact `streamID` from them, and lays the row into a column-friendly shape — all before storage is touched.
 
-That's why VL can speak Loki, Elasticsearch, OTel, syslog, journald, Datadog, Splunk, jsonline, and its native protocol without the storage engine ever growing a protocol-specific branch.
+That's the wager restated in one sentence each. naive-log decides it is storing "a line of text." VictoriaLogs decides it is storing "a typed row that already knows which stream it belongs to." Everything later in the series — sorting, columns, bloom filters, the inverted index — is only *possible* because of that one decision at the door. So let's stand at the door and watch a single line come through, slowed right down.
 
-#### The funnel - one binary, N doors, one convergence point 
-The router (app/vlinsert/main.go:42) dispatches each URL path to a protocol handler. Every handler does the same job and converges on one call:
-//Todo-claude= make an illustration to explain the above point 
+The first thing the door has to handle is chaos at the threshold. Logs arrive in roughly ten different wire formats — Loki, Elasticsearch, OpenTelemetry, syslog, journald, Datadog, Splunk, jsonline, and VictoriaLogs' own native protocol — and no sane storage engine wants to know about all of them. So the entire ingest layer exists to do one job: melt every one of those formats down into a single neutral shape — `(timestamp, []Field)` — and hand it across one narrow interface. Everything protocol-specific lives and dies on the ingest side of that boundary; the storage engine beneath never grows a branch for "is this Loki?"
+
+### The funnel — many doors, one convergence
+
+The router (<CodeRef to="app/vlinsert/main.go:42" />) sends each URL path to its own protocol handler. But every handler, however different its input, does the same job and ends at the same call:
 
 <Figure caption="The funnel. Around ten wire protocols enter through their own URL paths, but every handler does the same job: boil its format down to one neutral shape — (timestamp, []Field) — and hand it to a single call, lmp.AddRow. Past that convergence point nothing downstream knows which protocol a row came from.">
   <svg viewBox="0 0 720 320" role="img" aria-label="Ingestion funnel: many protocols to one call" style="width:100%;height:auto">
@@ -402,7 +483,7 @@ The router (app/vlinsert/main.go:42) dispatches each URL path to a protocol hand
   </svg>
 </Figure>
 
-The neutral shape is deliberately dumb — rows.go:18:
+The neutral shape is deliberately dumb — <CodeRef to="rows.go:18" />:
 
 ```go 
 type Field struct {
@@ -414,11 +495,11 @@ type Field struct {
 
 Both fields are strings. At ingest, everything is stringly-typed — even req.ms=12 arrives as the string "12". 
 
-#### Jsonline, traced end to end (the representative handler)
+### jsonline, traced end to end
 
-//Todo-claude= put the illustration here 
+We'll pick one handler and follow it all the way down, because the others are variations on its theme. jsonline is the plainest of them — a newline-delimited stream of JSON objects — which makes it the clearest place to see the shared skeleton every protocol wears.
 
-<Figure caption="The life of one jsonline request. Read the knobs once (GetCommonParams), open one processor wrapping one buffer, then loop: each line is parsed and handed to AddRow. At the end MustClose flushes whatever is left. The per-line work (readLine → AddRow) is the only part that repeats.">
+<Figure caption="The life of one jsonline request. Read the request's settings once (GetCommonParams), open one processor wrapping one buffer, then loop: each line is parsed and handed to AddRow. At the end MustClose flushes whatever is left. The per-line work (readLine → AddRow) is the only part that repeats.">
   <svg viewBox="0 0 720 210" role="img" aria-label="jsonline request lifecycle" style="width:100%;height:auto">
     <defs><filter id="rl7" x="-3%" y="-10%" width="106%" height="120%"><feTurbulence type="fractalNoise" baseFrequency="0.013" numOctaves="2" seed="6" result="n"/><feDisplacementMap in="SourceGraphic" in2="n" scale="1.6"/></filter><marker id="ah7" markerWidth="9" markerHeight="9" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" style="fill:var(--ink-soft)"/></marker></defs>
     <g filter="url(#rl7)">
@@ -449,7 +530,7 @@ Both fields are strings. At ingest, everything is stringly-typed — even req.ms
   </svg>
 </Figure>
 
-The heart is readLine (jsonline.go:98):
+The heart is readLine (<CodeRef to="jsonline.go:98" />):
 
 ```go 
 p := logstorage.GetJSONParser()
@@ -466,13 +547,12 @@ logstorage.RenameField(p.Fields, msgFields, "_msg")                    // ③ no
 lmp.AddRow(ts, p.Fields, -1)         
 ```
 
-Note the loop's error policy in processStreamInternal: a bad line is logged and skipped; the request only fails if every line failed (jsonline.go:88). One malformed log doesn't poison a batch.
+Note the loop's error policy in processStreamInternal: a bad line is logged and skipped; the request only fails if every line failed (<CodeRef to="jsonline.go:88" />). One malformed log doesn't poison a batch.
 
 
-### The three transformations — where the data model gets manufactured
-The wire has no concept of _time or _msg. The ingest layer invents them, per config, from arbitrary input. This is the conceptual core of Module 2:
+### The three transformations — where the data model is born
 
-//Todo-claude= put the illustration for the code trace for the three transformations here 
+Here is the conceptual heart of ingestion, and it's worth slowing down for. The wire knows nothing of `_time` or `_msg`; those are VictoriaLogs' ideas, not the sender's. The ingest layer *invents* them, per request, out of whatever arbitrary JSON showed up. Three small moves turn a stranger's object into VictoriaLogs' own data model:
 
 <Figure caption="The three transformations that manufacture the data model at the door. Nested keys are flattened to dotted names; the chosen time field is pulled out of the fields and into a real timestamp; the chosen message field is renamed to _msg. What enters as arbitrary JSON leaves as VictoriaLogs' flat, special-field data model.">
   <svg viewBox="0 0 720 232" role="img" aria-label="The three ingest transformations" style="width:100%;height:auto">
@@ -511,14 +591,14 @@ The wire has no concept of _time or _msg. The ingest layer invents them, per con
 
 Flattening matters: `{"req":{"path":"/x"}}` becomes a field literally named req.path. That's why VL's data model is flat even though JSON is nested — the flattening happens right here at the door.
 
-### CommonParams — the dial-board behind the transformations
+### CommonParams — how the door knows what you meant
 
-Those three transformations, and the streamID step coming up, all need to know one thing the handler can't guess: *which* incoming field is the timestamp, *which* is the message, *which* fields are the identity. Is the time in `ts`, `timestamp`, `@timestamp`? The generic handler has no idea. So every request **declares** the mapping, and `GetCommonParams` (`common_params.go:44`) distils that declaration into a single struct the rest of the pipeline reads.
+Those three transformations, and the streamID step just ahead, all depend on something the handler cannot guess: *which* incoming field is the timestamp, *which* is the message, *which* fields are the identity. Is the time in `ts`, in `timestamp`, in `@timestamp`? A generic handler has no way to know. So every request has to **say** — it declares the mapping — and `GetCommonParams` (<CodeRef to="common_params.go:44" />) gathers that declaration into a single struct the rest of the pipeline reads from.
 
-Every knob is read from **either** a query arg **or** a `VL-*` header — `getArray` checks both — so a `curl` user and a header-only log shipper drive the same code path.
+Each of these settings can be given **either** as a query arg **or** as a `VL-*` header — `getArray` checks both — so someone poking at it with `curl` and a production log shipper sending headers drive the exact same code path.
 
-<Figure caption="CommonParams is the one place the request's intent is distilled. Each knob can be set by a URL arg or an equivalent header, and each one feeds a specific downstream step. The generic handler holds no knowledge like 'ts means time' — it all arrives here, per request.">
-  <svg viewBox="0 0 720 236" role="img" aria-label="CommonParams control surface" style="width:100%;height:auto">
+<Figure caption="CommonParams is the one place the request's intent is gathered. Each setting can be given as a URL arg or an equivalent header, and each one feeds a specific downstream step. The generic handler holds no knowledge like 'ts means time' — it all arrives here, per request.">
+  <svg viewBox="0 0 720 236" role="img" aria-label="CommonParams per-request settings" style="width:100%;height:auto">
     <defs><filter id="rl9" x="-3%" y="-6%" width="106%" height="112%"><feTurbulence type="fractalNoise" baseFrequency="0.012" numOctaves="2" seed="2" result="n"/><feDisplacementMap in="SourceGraphic" in2="n" scale="1.5"/></filter><marker id="ah9" markerWidth="9" markerHeight="9" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" style="fill:var(--ink-soft)"/></marker></defs>
     <g filter="url(#rl9)">
       <rect x="14" y="58" width="190" height="34" rx="7" style="fill:var(--panel);stroke:var(--accent);stroke-width:1.5"/>
@@ -537,17 +617,17 @@ Every knob is read from **either** a query arg **or** a `VL-*` header — `getAr
     <text x="109" y="161" text-anchor="middle" style="fill:var(--ink);font-family:var(--font-mono);font-size:11px">VL-Stream-Fields:…</text>
     <text x="109" y="118" text-anchor="middle" style="fill:var(--ink-soft);font-family:var(--font-hand);font-size:13px">arg OR header</text>
     <text x="347" y="112" text-anchor="middle" style="fill:var(--ink);font-family:var(--font-hand);font-size:14px;font-weight:700">CommonParams</text>
-    <text x="347" y="132" text-anchor="middle" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:10px">the knobs</text>
+    <text x="347" y="132" text-anchor="middle" style="fill:var(--ink-soft);font-family:var(--font-mono);font-size:10px">per request</text>
     <text x="603" y="46" text-anchor="middle" style="fill:var(--ink);font-family:var(--font-mono);font-size:11px">TimeFields → _time</text>
     <text x="603" y="120" text-anchor="middle" style="fill:var(--ink);font-family:var(--font-mono);font-size:11px">MsgFields → _msg</text>
     <text x="603" y="194" text-anchor="middle" style="fill:var(--ink);font-family:var(--font-mono);font-size:11px">StreamFields → streamID</text>
   </svg>
 </Figure>
 
-The knobs that matter for this post:
+The settings that matter for this post:
 
 <Table
-  headers={['Knob', 'arg / header', 'Feeds']}
+  headers={['Setting', 'arg / header', 'Feeds']}
   rows={[
     ['<code>TimeFields</code>', '<code>_time_field</code> / <code>VL-Time-Field</code>', 'transformation ② — extract <code>_time</code>'],
     ['<code>MsgFields</code>', '<code>_msg_field</code> / <code>VL-Msg-Field</code>', 'transformation ③ — rename <code>_msg</code>'],
@@ -562,7 +642,7 @@ The knobs that matter for this post:
 
 ### The seam — one interface, injected once
 
-The ingest layer never imports the storage code. The moment a batch is ready, it pushes it through a two-method interface (`common_params.go:173`):
+The ingest layer never imports the storage code. The moment a batch is ready, it pushes it through a two-method interface (<CodeRef to="common_params.go:173" />):
 
 ```go
 type LogRowsStorage interface {
@@ -571,7 +651,7 @@ type LogRowsStorage interface {
 }
 ```
 
-Think of it as a wall socket. Ingest holds a plug that fits the socket and nothing more — it has no idea what's behind the wall. Exactly one line, at startup, decides what's plugged in (`app/victoria-logs/main.go:50`):
+Think of it as a wall socket. Ingest holds a plug that fits the socket and nothing more — it has no idea what's behind the wall. Exactly one line, at startup, decides what's plugged in (<CodeRef to="app/victoria-logs/main.go:50" />):
 
 ```go
 insertutil.SetLogRowsStorage(&vlstorage.Storage{})   // single-node: the local-disk storage
@@ -602,13 +682,17 @@ insertutil.SetLogRowsStorage(&vlstorage.Storage{})   // single-node: the local-d
 
 That one injection is the whole of the single-node-versus-cluster decision. Every file we've read, and every file left in this post, only ever presses that socket — none of them branch on "am I a cluster?"
 
+## Inside the buffer
+
+Our line has been parsed, normalized, and handed to `AddRow`. It is now inside VictoriaLogs — but not yet stored, not yet given its stream identity, not yet laid out. The rest of ingest happens here, in the space between "a request handed us fields" and "a batch crossed into storage." Three things happen to our line in that space: it waits in a buffer, it earns a `streamID`, and it gets laid down in a deliberately strange shape. We'll take them in that order.
+
 ### Buffering — one processor, one cart, three triggers
 
 `AddRow` does **not** store a row. A single request can carry thousands of lines, and writing each one to storage individually would recreate the naive store's tiny-write problem. So for each request the handler opens **one processor** owning **one reusable buffer** — call it the cart — and every line is dropped into that same cart until something decides to wheel it away.
 
 The cart isn't freshly allocated; it's borrowed from a pool (`GetLogRows`), already labelled with this request's `CommonParams` so it knows how to shape each line without being re-told. At terabytes a day, make-and-discard would bury the garbage collector; reuse is the Post-0 "cheap per row" economics showing up in code.
 
-#### AddRow, per line (`common_params.go:253`)
+#### AddRow, per line (<CodeRef to="common_params.go:253" />)
 
 ```go
 lmp.mu.Lock(); defer lmp.mu.Unlock()                     // claim the cart
@@ -648,7 +732,7 @@ The lock exists because a **background timer goroutine** can also reach for the 
   </svg>
 </Figure>
 
-`flushLocked` (`common_params.go:319`) is the drain: `MustAddRows(lr)` pushes the whole batch through the socket, then `ResetKeepSettings()` empties the cart but keeps its label — so it's the **same** cart start to finish, emptied and refilled, never swapped. `MustClose` does a final flush and returns the cart to the pool, so no line is ever stranded in a half-full cart.
+`flushLocked` (<CodeRef to="common_params.go:319" />) is the drain: `MustAddRows(lr)` pushes the whole batch through the socket, then `ResetKeepSettings()` empties the cart but keeps its label — so it's the **same** cart start to finish, emptied and refilled, never swapped. `MustClose` does a final flush and returns the cart to the pool, so no line is ever stranded in a half-full cart.
 
 #### The visibility gap — two buffers in series
 
@@ -687,7 +771,9 @@ So the honest phrasing for the post: *a freshly ingested row isn't searchable fo
 
 ### streamID — four doors, one formula
 
-Post 0 taught the **recipe**: a streamID is `tenant + hash128` of the chosen stream fields, sorted into a canonical form so order never matters. What Post 0 left open is the ingest-time question: when a raw row arrives, *how does VictoriaLogs know which fields are the stream fields?* Because the protocols disagree, `MustAdd` (`log_rows.go:359`) offers **four doors** into the same recipe.
+This is the step that gives the post its name — the one thing naive-log never does. naive-log appends an opaque line; VictoriaLogs appends a row that *already knows which stream it belongs to*. Everything downstream — the per-stream grouping, the cheap sort, the skippable blocks — is bought here, at the cost of one hash computed on the way in.
+
+Post 0 taught the **recipe**: a streamID is `tenant + hash128` of the chosen stream fields, sorted into a canonical form so order never matters. What Post 0 left open is the ingest-time question — when a raw row arrives, *how does VictoriaLogs even know which fields are the stream fields?* The protocols disagree about where that information lives, so `MustAdd` (<CodeRef to="log_rows.go:359" />) offers **four doors** into the same recipe.
 
 <Figure caption="Four doors, one formula. Three ways a row inside MustAdd declares its stream fields — by position, by configured name, or by an embedded _stream label — plus a native door where the id was already computed upstream in a cluster. All of them converge on the same recipe: sort to canonical bytes, hash, prepend the tenant.">
   <svg viewBox="0 0 720 300" role="img" aria-label="Four doors to the streamID formula" style="width:100%;height:auto">
@@ -739,7 +825,7 @@ sid.id = hash128(bb.B)             // the 128-bit hash
 
 ### The gate and the layout
 
-The streamID done, the row reaches `mustAddInternal` (`log_rows.go:428`) — the last stop in this post. It does two jobs: check the row is allowed in, then lay it into the cart in a deliberately odd shape.
+The streamID done, the row reaches `mustAddInternal` (<CodeRef to="log_rows.go:428" />) — the last stop in this post. It does two jobs: check the row is allowed in, then lay it into the cart in a deliberately odd shape.
 
 #### The gate — three limits
 
@@ -808,7 +894,7 @@ The payoffs are both downstream, but the shape is locked in now: separated key a
 
 #### Store once — the repetition trick
 
-The field text itself gets one more optimization, and it exploits the Post-0 fact that logs are massively repetitive. When a field is identical to the field in the **same column of the row directly above**, VictoriaLogs doesn't write the text again — it reuses it, like a ditto mark in a hand-written ledger (`addFieldsInternal`, `log_rows.go:489`).
+The field text itself gets one more optimization, and it exploits the Post-0 fact that logs are massively repetitive. When a field is identical to the field in the **same column of the row directly above**, VictoriaLogs doesn't write the text again — it reuses it, like a ditto mark in a hand-written ledger (`addFieldsInternal`, <CodeRef to="log_rows.go:489" />).
 
 <Figure caption="Logs repeat, so repeated field values are stored once. A field identical to the one in the same column of the previous row is reused (a ditto mark), not rewritten. Here only the message changes line to line, so service and level cost nothing after the first row — foreshadowing the dictionary and const-column encodings of Post 4.">
   <svg viewBox="0 0 720 196" role="img" aria-label="Adjacent-duplicate reuse" style="width:100%;height:auto">
@@ -847,25 +933,27 @@ Before that, each field runs a quick filter — empty values are dropped (empty 
 
 Be precise about the limits of what we've built: this is **not yet columnar** (each row's fields are still grouped in its window), and **not yet sorted**. The sort by `(streamID, timestamp)`, the transpose into real columns, and the freeze into an immutable part all happen past the socket — and that's where Post 2 opens.
 
-### Where this post ends
+## Where this leaves us
+
+### The whole path, and the line we won't cross
 
 ```text
 HTTP POST /insert/jsonline (bytes)
-  │ parse+flatten · extract _time · rename _msg       ← Module 2
+  │ parse+flatten · extract _time · rename _msg      
   ▼ (timestamp, []Field) ──▶ lmp.AddRow
-  │ accumulate in one pooled cart; flush on size/time/close   ← Module 3
+  │ accumulate in one pooled cart; flush on size/time/close  
   ▼ MustAdd
-  │ pick a door → MarshalCanonical → hash128 → streamID        ← Module 4
+  │ pick a door → MarshalCanonical → hash128 → streamID       
   ▼ mustAddInternal
-  │ gate (2000/128B/2MiB) · drop empties · store-once · SoA     ← Module 5
+  │ gate (2000/128B/2MiB) · drop empties · store-once · SoA    
   ▼ [ cart: arrival order · not sorted · not columnar ]
   ═══ the socket: MustAddRows ═══  ← Post 1 ends here
-  ▼ storage buffers ~1s → in-memory part (searchable)          ← Post 2 / 3
+  ▼ storage buffers ~1s → in-memory part (searchable)        
 ```
 
-### Do it yourself — prove the row was shaped
+### Prove it to yourself
 
-Everything above you can watch on the running server from Post 0. Ingest one line, naming `service` as the stream field, then read it back:
+None of this has to be taken on faith — the whole chapter is visible from a terminal. Spin up the server from Post 0, send one line naming `service` as the stream field, then ask for it back:
 
 ```sh
 curl -X POST 'http://localhost:9428/insert/jsonline?_time_field=ts&_msg_field=message&_stream_fields=service' \

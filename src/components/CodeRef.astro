@@ -1,0 +1,139 @@
+---
+// CodeRef — an inline, hand-drawn chip for a source-code reference like
+// `app/vlinsert/main.go:42`, `rows.go:18`, or a line range `log_rows.go:489-510`.
+//
+// It reads like a scrap torn from the source tree: a dog-eared page glyph, the
+// directory faded back, the filename underlined with the blog's wavy teal
+// stroke, and the line number set as a tilted editor "gutter" badge (with a
+// gutter tick on its left). Pass `href` to make it a link to the source.
+//
+//   <CodeRef to="app/vlinsert/main.go:42" />
+//   <CodeRef to="rows.go:18" href="https://github.com/.../rows.go#L18" />
+//
+interface Props {
+  /** The reference, e.g. "app/vlinsert/main.go:42" or "log_rows.go:489-510". */
+  to: string;
+  /** Optional link to the source (GitHub, etc.). Renders as <a> when present. */
+  href?: string;
+}
+const { to, href } = Astro.props;
+
+const m = to.match(/^(.*?):(\d+)(?:-(\d+))?$/);
+const refPath = m ? m[1] : to;
+const lineStart = m ? m[2] : null;
+const lineEnd = m && m[3] ? m[3] : null;
+const lineLabel = lineEnd ? `${lineStart}–${lineEnd}` : lineStart;
+
+const slash = refPath.lastIndexOf('/');
+const dir = slash >= 0 ? refPath.slice(0, slash + 1) : '';
+const file = slash >= 0 ? refPath.slice(slash + 1) : refPath;
+
+const Tag = href ? 'a' : 'span';
+const title = lineStart ? `${refPath}, line ${lineLabel}` : refPath;
+const extraAttrs = href ? { href, target: '_blank', rel: 'noopener' } : {};
+---
+<Tag class="coderef" title={title} {...extraAttrs}>
+  <svg class="cr-page" viewBox="0 0 14 16" aria-hidden="true">
+    <path d="M1.5 1.5 H9 L12.5 5 V14.5 H1.5 Z" />
+    <path class="cr-dogear" d="M9 1.5 V5 H12.5" />
+    <line x1="4" y1="8" x2="10" y2="8" />
+    <line x1="4" y1="10.5" x2="9" y2="10.5" />
+  </svg>
+  <span class="cr-text">{dir && <span class="cr-dir">{dir}</span>}<span class="cr-file">{file}</span></span>
+  {lineStart && (
+    <span class="cr-ln" aria-label={`line ${lineLabel}`}>{lineLabel}</span>
+  )}
+</Tag>
+
+<style>
+  .coderef {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.28em;
+    padding: 0.05em 0.35em 0.05em 0.3em;
+    margin: 0 0.06em;
+    border-radius: 7px 8px 6px 9px; /* uneven corners read as hand-drawn */
+    background: color-mix(in srgb, var(--ink-soft) 7%, var(--panel));
+    border: 1.2px solid color-mix(in srgb, var(--line) 85%, transparent);
+    font-family: var(--font-mono);
+    font-size: 0.82em;
+    line-height: 1.3;
+    vertical-align: baseline;
+    text-decoration: none;
+    color: var(--ink);
+    transform: rotate(-0.4deg);
+    transition: transform 0.14s ease, border-color 0.14s ease, background 0.14s ease;
+  }
+
+  /* file glyph — a dog-eared page in the "query" accent */
+  .cr-page {
+    width: 0.86em;
+    height: auto;
+    flex: none;
+    fill: none;
+    stroke: var(--accent);
+    stroke-width: 1.3;
+    stroke-linejoin: round;
+    stroke-linecap: round;
+    transform: translateY(0.04em) rotate(-3deg);
+  }
+  .cr-page .cr-dogear { stroke: var(--accent); }
+  .cr-page line { stroke: color-mix(in srgb, var(--accent) 55%, transparent); }
+
+  .cr-dir {
+    color: var(--ink-soft);
+    opacity: 0.75;
+    font-size: 0.9em;
+  }
+  .cr-file {
+    color: var(--ink);
+    font-weight: 600;
+    /* the blog's signature self-drawn underline, native + theme-aware */
+    text-decoration: underline;
+    text-decoration-style: wavy;
+    text-decoration-color: color-mix(in srgb, var(--accent2) 70%, transparent);
+    text-decoration-thickness: from-font;
+    text-underline-offset: 3px;
+  }
+
+  /* line number as a tilted editor gutter badge, with a gutter tick */
+  .cr-ln {
+    font-family: var(--font-mono);
+    font-weight: 700;
+    font-size: 0.86em;
+    color: var(--accent2);
+    background: color-mix(in srgb, var(--accent2) 14%, var(--panel));
+    border: 1.1px solid color-mix(in srgb, var(--accent2) 38%, transparent);
+    border-left: 3px solid var(--accent2); /* the gutter rail */
+    border-radius: 3px 6px 5px 6px;
+    padding: 0 0.34em 0 0.28em;
+    transform: rotate(-1.6deg);
+    transition: transform 0.14s ease;
+  }
+
+  /* hover: the scrap lifts flat, the badge straightens, the underline fills in */
+  .coderef:hover,
+  .coderef:focus-visible {
+    transform: rotate(0deg) translateY(-1px);
+    border-color: color-mix(in srgb, var(--accent2) 45%, var(--line));
+    background: color-mix(in srgb, var(--accent2) 9%, var(--panel));
+    outline: none;
+  }
+  .coderef:hover .cr-ln,
+  .coderef:focus-visible .cr-ln {
+    transform: rotate(0deg);
+  }
+  .coderef:hover .cr-file,
+  .coderef:focus-visible .cr-file {
+    text-decoration-color: var(--accent2);
+  }
+  a.coderef:hover .cr-page { stroke: var(--accent2); }
+  a.coderef:hover .cr-page .cr-dogear { stroke: var(--accent2); }
+
+  @media (prefers-reduced-motion: reduce) {
+    .coderef,
+    .cr-ln { transition: none; transform: none; }
+    .coderef:hover,
+    .coderef:focus-visible { transform: none; }
+  }
+</style>

@@ -1,0 +1,250 @@
+---
+/**
+ * Full-text search backed by Pagefind — framework-free.
+ *
+ * This replaces the former React island. The trigger button and (hidden) modal
+ * are server-rendered static HTML; a small vanilla script wires up behavior and
+ * lazy-loads the Pagefind runtime the first time search opens. Keeping this out
+ * of React means pages that have no other island (home, tags, about) ship zero
+ * framework JavaScript — a ~44 KB gzipped saving on every such page.
+ *
+ * Pagefind indexes the built HTML at `astro build` time and shards the index,
+ * so the browser only downloads the fragments a given query needs.
+ */
+---
+
+<button type="button" class="search-trigger" data-search-open aria-label="Search posts">
+  <svg viewBox="0 0 24 24" fill="none" aria-hidden="true" stroke-linecap="round">
+    <circle cx="11" cy="11" r="7" stroke="currentColor" stroke-width="2"></circle>
+    <path d="M20 20 L16 16" stroke="currentColor" stroke-width="2"></path>
+  </svg>
+  <span class="search-trigger-label">Search</span>
+  <kbd>/</kbd>
+</button>
+
+<div class="search-overlay" role="dialog" aria-modal="true" aria-label="Search posts" data-search-overlay hidden>
+  <div class="search-modal" data-search-modal>
+    <div class="search-inputrow">
+      <svg viewBox="0 0 24 24" fill="none" aria-hidden="true" stroke-linecap="round">
+        <circle cx="11" cy="11" r="7" stroke="currentColor" stroke-width="2"></circle>
+        <path d="M20 20 L16 16" stroke="currentColor" stroke-width="2"></path>
+      </svg>
+      <input
+        class="search-input"
+        type="search"
+        placeholder="Search the full text…"
+        autocomplete="off"
+        spellcheck="false"
+        data-search-input
+      />
+      <button type="button" class="search-close" data-search-close>esc</button>
+    </div>
+    <ul class="search-results" data-search-results></ul>
+    <div class="search-hint">↑↓ navigate · ↵ open · esc close</div>
+  </div>
+</div>
+
+<script>
+  // --- Pagefind runtime, loaded once on first open ---------------------------
+  let pagefindPromise: Promise<any> | null = null;
+  function loadPagefind(): Promise<any> {
+    if (!pagefindPromise) {
+      const url = `${import.meta.env.BASE_URL}pagefind/pagefind.js`.replace('//', '/');
+      pagefindPromise = import(/* @vite-ignore */ url)
+        .then(async (pf: any) => {
+          await pf.options?.({ excerptLength: 22 });
+          await pf.init?.();
+          return pf;
+        })
+        .catch(() => null);
+    }
+    return pagefindPromise;
+  }
+
+  interface Result {
+    url: string;
+    title: string;
+    excerpt: string; // sanitized HTML from Pagefind, matches wrapped in <mark>
+  }
+
+  const overlay = document.querySelector<HTMLElement>('[data-search-overlay]');
+  const modal = document.querySelector<HTMLElement>('[data-search-modal]');
+  const input = document.querySelector<HTMLInputElement>('[data-search-input]');
+  const list = document.querySelector<HTMLUListElement>('[data-search-results]');
+  const openBtn = document.querySelector<HTMLButtonElement>('[data-search-open]');
+  const closeBtn = document.querySelector<HTMLButtonElement>('[data-search-close]');
+
+  // Guard: if the markup isn't present for some reason, do nothing.
+  if (overlay && modal && input && list && openBtn && closeBtn) {
+    let open = false;
+    let status: 'idle' | 'ready' | 'error' = 'idle';
+    let results: Result[] = [];
+    let active = 0;
+    let debounceTimer = 0;
+    let focusTimer = 0;
+    let queryToken = 0; // invalidates in-flight searches
+
+    function escapeHtml(s: string): string {
+      return s.replace(/[&<>"']/g, (c) =>
+        ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c] as string
+      );
+    }
+
+    function render() {
+      const term = (input!.value || '').trim();
+      list!.innerHTML = '';
+
+      if (status === 'error') {
+        list!.appendChild(
+          emptyRow('Search index isn’t available yet — build the site to generate it.')
+        );
+        return;
+      }
+      if (!term) {
+        list!.appendChild(emptyRow('Type to search across every post.'));
+        return;
+      }
+      if (results.length === 0) {
+        list!.appendChild(emptyRow(`No matches for “${term}”.`));
+        return;
+      }
+
+      results.forEach((r, i) => {
+        const li = document.createElement('li');
+        const a = document.createElement('a');
+        a.href = r.url;
+        a.className = `search-item${i === active ? ' is-active' : ''}`;
+        a.addEventListener('mouseenter', () => {
+          active = i;
+          syncActive();
+        });
+        a.addEventListener('click', (e) => {
+          e.preventDefault();
+          go(r.url);
+        });
+
+        const title = document.createElement('span');
+        title.className = 'search-item-title';
+        title.textContent = r.title;
+
+        const snip = document.createElement('span');
+        snip.className = 'search-item-snip';
+        snip.innerHTML = r.excerpt; // Pagefind-sanitized, contains <mark>
+
+        a.append(title, snip);
+        li.appendChild(a);
+        list!.appendChild(li);
+      });
+    }
+
+    function emptyRow(text: string): HTMLLIElement {
+      const li = document.createElement('li');
+      li.className = 'search-empty';
+      li.textContent = text;
+      return li;
+    }
+
+    function syncActive() {
+      const items = list!.querySelectorAll<HTMLElement>('.search-item');
+      items.forEach((el, i) => el.classList.toggle('is-active', i === active));
+    }
+
+    function openSearch() {
+      if (open) return;
+      open = true;
+      overlay!.hidden = false;
+      focusTimer = window.setTimeout(() => input!.focus(), 30);
+      render();
+      loadPagefind().then((pf) => {
+        status = pf ? 'ready' : 'error';
+        if (status === 'error') render();
+      });
+    }
+
+    function close() {
+      open = false;
+      overlay!.hidden = true;
+      input!.value = '';
+      results = [];
+      active = 0;
+      window.clearTimeout(debounceTimer);
+      window.clearTimeout(focusTimer);
+      queryToken++;
+    }
+
+    function go(url: string) {
+      window.location.href = url;
+    }
+
+    function runQuery() {
+      const term = (input!.value || '').trim();
+      active = 0;
+      if (!term) {
+        results = [];
+        render();
+        return;
+      }
+      const token = ++queryToken;
+      window.clearTimeout(debounceTimer);
+      debounceTimer = window.setTimeout(async () => {
+        const pf = await loadPagefind();
+        if (token !== queryToken) return;
+        if (!pf) {
+          status = 'error';
+          render();
+          return;
+        }
+        const search = await pf.search(term);
+        if (token !== queryToken || !search) return;
+        const data = await Promise.all(
+          search.results.slice(0, 8).map((r: any) => r.data())
+        );
+        if (token !== queryToken) return;
+        results = data.map((d: any) => ({
+          url: d.url,
+          title: d.meta?.title || d.url,
+          excerpt: d.excerpt as string,
+        }));
+        render();
+      }, 120);
+    }
+
+    // --- events --------------------------------------------------------------
+    openBtn.addEventListener('click', openSearch);
+    closeBtn.addEventListener('click', close);
+    input.addEventListener('input', runQuery);
+
+    // close when clicking the backdrop, but not the modal itself
+    overlay.addEventListener('mousedown', close);
+    modal.addEventListener('mousedown', (e) => e.stopPropagation());
+
+    input.addEventListener('keydown', (e) => {
+      if (e.key === 'ArrowDown') {
+        e.preventDefault();
+        active = Math.min(active + 1, results.length - 1);
+        syncActive();
+      } else if (e.key === 'ArrowUp') {
+        e.preventDefault();
+        active = Math.max(active - 1, 0);
+        syncActive();
+      } else if (e.key === 'Enter' && results[active]) {
+        e.preventDefault();
+        go(results[active].url);
+      }
+    });
+
+    // global shortcuts: "/" or Cmd/Ctrl+K to open, Esc to close
+    document.addEventListener('keydown', (e) => {
+      const el = e.target as HTMLElement | null;
+      const typing =
+        !!el && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.isContentEditable);
+      if (!open && (e.key === '/' || ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'k'))) {
+        if (typing && e.key === '/') return;
+        e.preventDefault();
+        openSearch();
+      } else if (open && e.key === 'Escape') {
+        close();
+      }
+    });
+  }
+</script>
